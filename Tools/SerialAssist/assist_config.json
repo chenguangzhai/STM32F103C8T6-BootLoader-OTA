@@ -1,0 +1,12 @@
+{
+  "port": "COM25  USB 串行设备 (COM25)",
+  "baud": "115200",
+  "disp_mode": "UTF-8",
+  "autoscroll": true,
+  "timestamp": false,
+  "chunk": "256",
+  "delay": "1",
+  "auto_reset": true,
+  "last_file": "D:/All_projects/STM32_Project/HAL/STM32F103ZET6/Boot_Loader/Application/build/Debug/Application.bin",
+  "geometry": "1280x900+907+207"
+}

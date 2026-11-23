@@ -1,0 +1,35 @@
+# 构建产物（CMake / EIDE / MDK）
+build/
+dist/
+*.o
+*.d
+*.elf
+*.map
+*.hex
+*.su
+*.lnp
+*.pkg
+*.objlist
+*.axf
+*.crf
+*.dep
+
+# Python（上位机工具）
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器本地配置
+.vscode/
+.idea/
+
+# AI 工作区数据（本地工作日志，含本机路径）
+.workbuddy/
+
+# 参考工程副本（第三方资料，且内含独立 .git）
+参考/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
