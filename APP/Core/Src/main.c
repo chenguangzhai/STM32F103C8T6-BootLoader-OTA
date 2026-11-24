@@ -31,6 +31,7 @@
 #include "w25q_test.h"      /* W25Q64 上电自检，结果从 UART_LOG 打印 */
 #include "ota_flag.h"       /* 确认制：App 启动成功后擦更新标志 */
 #include "ota_backup.h"     /* 回滚：确认前把当前固件备份到 W25Q 0x200000 */
+#include "can_drv.h"        /* CAN 驱动：阶段 1a，覆盖时序 + 过滤器 + 回环自测 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -123,6 +124,53 @@ int main(void)
 		Uart_Printf(UART_LOG, "[app] w25q init %s\r\n", (st == 0U) ? "OK" : "FAIL");
 	}
 
+	/* 【阶段 1a】CAN 驱动初始化 + 回环自测（2026-11-24 新增）
+	   职责已调整：位时序 / ABOM / ARD / RFL / 工作模式 / NVIC 全部由 CubeMX 与 .ioc 生成，
+	   CanDrv_Init() 一个参数都不写，只做「读回校验 + 配过滤器 + Start + 激活中断」。
+	   这样参数只有 .ioc 一个来源，重新生成代码不会和代码里的数值打架。
+	   错误码含义：
+	     -2 状态不对（MX_CAN_Init 没跑或已被启动过）
+	     -6 位时序不符预期 500kbps/88.9% → 查 .ioc 的 Prescaler / BS1 / BS2
+	     -7 CAN1 RX0 中断未使能 → CubeMX 的 NVIC 里没勾，收帧回调永远不会被调用
+	   为什么先跑回环：暂时没有 USB-CAN 分析仪，CAN_MODE_LOOPBACK 的收发全在 CAN 内核内部
+	   完成，不经过引脚、不需要收发器、不需要外部 ACK，但同样走完
+	   「时序 → 过滤器 → 中断 → 回调 → 队列」整条路径 —— 这正是 1a 的验收内容。
+	   有分析仪之后：把 .ioc 里 CAN Mode 改回 Normal、勾上 CAN1 RX0 中断、
+	   把 CAN_STB(PB7) 拉低（gpio.c 现在置高 = 收发器待机，帧出不去）。 */
+	{
+		int8_t cr = CanDrv_Init();
+
+		if (cr == CANDRV_OK)
+		{
+			Uart_Printf(UART_LOG, "[can] init OK, %lu bps, sample %u.%u%%, %s\r\n",
+						(unsigned long)CanDrv_ActualBaudrate(),
+						(unsigned int)(CanDrv_ActualSamplePointPermille() / 10U),
+						(unsigned int)(CanDrv_ActualSamplePointPermille() % 10U),
+						(CanDrv_GetMode() == CANDRV_MODE_LOOPBACK) ? "loopback" : "normal");
+
+			if (CanDrv_GetMode() == CANDRV_MODE_LOOPBACK)
+			{
+				int8_t sr = CanDrv_SelfTest();
+
+				Uart_Printf(UART_LOG, "[can] loopback self-test %s (tx=%lu ovf=%lu err=%lu bof=%lu)\r\n",
+							(sr == CANDRV_OK) ? "PASS" : "FAIL",
+							(unsigned long)CanDrv_TxOkCount(),
+							(unsigned long)CanDrv_RxOverflowCount(),
+							(unsigned long)CanDrv_ErrorCount(),
+							(unsigned long)CanDrv_BusOffCount());
+			}
+			else
+			{
+				/* 正常模式没有对端时硬测只会得到误导性的 FAIL，这里明确跳过 */
+				Uart_Printf(UART_LOG, "[can] normal mode: self-test skipped (needs a peer)\r\n");
+			}
+		}
+		else
+		{
+			Uart_Printf(UART_LOG, "[can] init FAIL code=%d\r\n", (int)cr);
+		}
+	}
+
 #if (OTA_TEST_CRASH != 0)
 	/* 【回滚测试桩】制造 HardFault，模拟"新固件跑飞"。
 	   放在确认逻辑之前：此时标志仍是 APPLIED、备份还没被覆盖，
@@ -191,6 +239,7 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
 		/* 关键：LED 用非阻塞定时，不能用 HAL_Delay(500)。
 		   HAL_Delay 会让主循环 1 秒才取一次串口数据，而 1KB 环缓冲在 115200 下

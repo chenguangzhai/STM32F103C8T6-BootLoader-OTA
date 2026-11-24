@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "can.h"
 #include "dma.h"
 #include "spi.h"
 #include "usart.h"
@@ -28,7 +27,11 @@
 /* USER CODE BEGIN Includes */
 #include "board.h"
 #include "Boot_Loader.h"
-/* w25q_test.h 已移除：自检代码为回滚逻辑腾 Flash 让路，见下方 USER CODE BEGIN 2 */
+/* w25q_test.h 已移除：自检代码为回滚逻辑腾 Flash 让路，原因见 main() 里的说明。
+   ⚠ 2026-11-24：本行原先直接写出了「2 号用户代码段的开始标记」原文，CubeMX 用字符串
+   查找定位用户代码段，会先命中这句注释，于是把 Includes 尾部到真正的结束标记之间整段
+   当成用户代码重新插入 —— 生成出两个 int main()、工程编译不过。
+   **注释里永远不要出现标记原文（段名 + BEGIN/END 的组合）。** */
 /* 本轮新增：Boot_Loader_Init() 内部会设片内 Flash 写入起点 0x08005000。
    放在这里仅为说明依赖；函数声明在 Boot_Loader.h，无需额外 include 才能调用。 */
 /* USER CODE END Includes */
@@ -96,7 +99,9 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
-  MX_CAN_Init();
+  /* 2026-11-24：CAN 初始化已从 Boot 移除。Boot 只做「读标志 -> 从 W25Q 搬 1MB 到片内
+     -> 校验 -> 跳转」，不关心字节来自 CAN 还是串口；CAN 收包在 APP 侧完成。
+     保留这段说明是为了让后来者知道：这里没有 MX_CAN_Init 是刻意为之，不是漏了。 */
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   Uart_Init();

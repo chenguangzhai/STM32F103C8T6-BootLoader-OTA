@@ -3,17 +3,13 @@
 """无界面 OTA 发送端（调试 / CI 用）
 
 和 GUI 的关系：**协议打包不重复实现**，直接 import serial_assist 里的
-build_fwup_header / build_ota_tail。这样只有一处字节定义，不会漂移。
+build_ota_tail。这样只有一处字节定义，不会漂移。
 
-两种模式：
+三种模式（2026-11-24：按用户要求移除 app-ota / FWUP 路径）：
 
   boot-ota <bin>   老协议，目标 = BootLoader
                    SWD 复位 → 裸字节流 → 12 字节 OTAE 尾 → Boot 自己校验跳转
                    适用：把"带 bug 的 App"换成新的，因为旧 App 还不会收新协议
-
-  app-ota  <bin>   新协议，目标 = 正在运行的 App
-                   32 字节 FWUP 头 → 等 300ms → 裸字节流 → App 自己写槽+复位
-                   不碰内部 Flash，下载全程旧固件完好
 
   flash-boot <bin> 直接经 SWD 把 bin 烧到 0x08000000（BootLoader 自己）。
                    Boot 不能自己升级自己，改 Boot 只能走这条路。
@@ -23,7 +19,6 @@ build_fwup_header / build_ota_tail。这样只有一处字节定义，不会漂�
                    查"上电到底发生了什么"用它，比 flash-boot 轻。
 
 用法：
-  python ota_headless.py app-ota ../../Application/build/Debug/Application.bin
   python ota_headless.py boot-ota xxx.bin --port COM25 --chunk 256 --delay 1
 
 退出码：0 = 看到成功标志；1 = 超时或无成功标志；2 = 参数/环境错误
@@ -48,8 +43,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 # 协议定义复用 GUI 那份，不在这里另写
+# 2026-11-24：build_fwup_header 随「新架构」一起移除，app-ota 模式已删除。
 from serial_assist import (          # noqa: E402
-    build_fwup_header, build_ota_tail, find_openocd, openocd_reset,
+    build_ota_tail, find_openocd, openocd_reset,
 )
 
 
@@ -163,19 +159,13 @@ def flash_boot(rd, path, base=0x08000000, timeout=60):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["boot-ota", "app-ota", "flash-boot", "watch"])
+    ap.add_argument("mode", choices=["boot-ota", "flash-boot", "watch"])
     ap.add_argument("binfile", nargs="?", help="watch 模式不需要")
     ap.add_argument("--port", default="COM25")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--delay", type=float, default=1.0, help="块间延时 ms")
-    ap.add_argument("--ver", type=int, default=1,
-                    help="固件版本号 1..65535，写进 FWUP 头，Boot 用它拦降级")
     args = ap.parse_args()
-
-    if not (1 <= args.ver <= 65535):
-        print("版本号必须在 1..65535 之间，当前 {}".format(args.ver))
-        return 2
 
     data = b""
     crc = 0
@@ -263,30 +253,6 @@ def main():
             rd.wait_for("校验通过", 8.0)
             rd.wait_quiet(0.4, 3.0)
             ok = rd.saw("校验通过") and rd.saw("跳转到 App")
-
-        else:  # app-ota
-            hdr = build_fwup_header(args.ver, len(data), crc)
-            print("[1/3] 发 32 字节 FWUP 头（版本 {}）：{}".format(
-                args.ver,
-                " ".join("{:02X}".format(b) for b in hdr[:8]) + " ..."))
-            ser.write(hdr)
-            # 等 App 擦完头部扇区再发数据（W25Q 扇区擦除典型 45ms）
-            time.sleep(0.3)
-            print("[2/3] 开始发送固件")
-            send_stream(ser, data, args.chunk, args.delay, "固件数据")
-            print("[3/3] 等 App 校验、写头、自复位 ...")
-            rd.wait_for("复位回 BootLoader", 6.0)
-            # App 复位后会走 Boot：读槽 → 搬运（静默几百 ms）→ 3 s 窗口 → 跳转 → App 打印。
-            # 静默阈值给到 5 s，是为了跨过那 3 s 上电窗口；给 0.5 s 会在
-            # 搬运/窗口期间就判定结束，把 [apply] done 和 jump 全漏掉（踩过一次）
-            rd.wait_quiet(5.0, 30.0)
-            ok = (rd.saw("头部已写入") and rd.saw("[slot] A：")
-                  and (rd.saw("跳转到 App") or rd.saw("编译时间")))
-            if rd.saw("拒绝降级"):
-                print("!! Boot 拒绝了这次升级：版本 {} 低于板子当前的版本，"
-                      "固件已收进槽 A 但没有搬运。换个更高的版本号重发即可"
-                      .format(args.ver))
-                ok = False
 
     finally:
         rd.stop_flag = True

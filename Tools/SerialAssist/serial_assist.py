@@ -33,7 +33,7 @@ import threading
 import time
 import tkinter as tk
 import zlib
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 try:
     import serial
@@ -74,6 +74,87 @@ C_OTA     = "#0E7490"
 
 FONT_UI   = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
+
+# 2026-11-24：接收区着色改为「规则表」驱动 —— 每条规则 = 一组关键词 + 一组颜色。
+# 换工程时只要改规则（或整个拷走 assist_config.json），不用改代码、不用重打包。
+#
+# 规则字段：
+#   tag       Tk text tag 名，也作字典键；默认六条的 tag 固定，自定义用 custom1...
+#   name      界面上显示的规则名
+#   pattern   关键词，用 | 分隔多个；命中任意一个即算匹配（子串、区分大小写）
+#   fg / bg   前景/背景色，bg 为空串表示不设背景
+# 2026-11-24 晚：移除 builtin 标记 —— 用户要求「全部规则都能随意改」，
+# 默认六条也只是"初始值"，同样可删可改；删光后点「恢复默认」能一键找回。
+# 匹配顺序 = 列表顺序，首命中即停。所以 FAIL 默认排在 ok 之前 ——
+# 否则 "[ota] verify FAIL" 会先被 ok 规则染绿，失败就不显眼了。
+# 顺序由用户用 ↑↓ 自行调整，代码不再强制任何规则的位置。
+DEFAULT_LOG_RULES = [
+    {"tag": "bad",  "name": "FAIL / ERROR", "pattern": "FAIL|ERROR|error",
+     "fg": C_BAD,  "bg": "#FDECEA"},
+    {"tag": "boot", "name": "[boot]",       "pattern": "[boot]",
+     "fg": C_BOOT, "bg": ""},
+    {"tag": "ota",  "name": "[ota]",        "pattern": "[ota]",
+     "fg": C_OTA,  "bg": ""},
+    {"tag": "rst",  "name": "[rst]",        "pattern": "[rst]",
+     "fg": C_WARN, "bg": ""},
+    {"tag": "good", "name": "ok / OK",      "pattern": " ok|OK",
+     "fg": C_OK,   "bg": ""},
+    # sys 默认不参与文本匹配：工具提示行和 HEX 行直接挂这个 tag。
+    # 用户完全可以删掉它或给它写关键词 —— 删掉后工具提示行失去灰色，
+    # 显示默认字色（不会报错），这是"全部可改"的预期结果。
+    {"tag": "sys",  "name": "系统提示",     "pattern": "",
+     "fg": C_SUB,  "bg": ""},
+]
+HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def default_log_rules():
+    """返回默认规则表的深拷贝。每次调用都新建，避免界面改动污染常量。"""
+    return [dict(r) for r in DEFAULT_LOG_RULES]
+
+
+def load_log_rules(cfg):
+    """从配置读规则表；缺项/坏值回退默认色，绝不把非法颜色交给 Tk。
+
+    2026-11-24：兼容上一版的 log_colors 字典 —— 老用户升级后原来改过的
+    六种颜色不会丢；新的 log_rules 优先（存在且是 list 时就以它为准）。
+    """
+    defaults = default_log_rules()
+    raw = cfg.get("log_rules")
+    if isinstance(raw, list):
+        # 2026-11-24 修正：配置保存的是「完整规则表」，加载以配置为唯一来源。
+        # 2026-11-24 晚再修正：不再补齐缺失的默认规则 —— 用户要求全部可删，
+        # 若这里把删掉的补回来，删除就形同虚设（关窗重开规则又冒出来）。
+        # 只有 log_rules 整个键不存在（首次运行/老版本）才用 default_log_rules()。
+        rules = []
+        seen = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            tag = item.get("tag")
+            if not isinstance(tag, str) or not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", tag):
+                continue                    # 非法 tag 名会让 Tk 抛异常
+            if tag in seen or tag == "sel":  # sel 是 Tk 内置选区标签，不能占用
+                continue
+            seen.add(tag)
+            fg = item.get("fg")
+            bg = item.get("bg")
+            rules.append({
+                "tag": tag,
+                "name": str(item.get("name") or tag),
+                "pattern": str(item.get("pattern") or ""),
+                "fg": fg if isinstance(fg, str) and HEX_COLOR_RE.match(fg) else C_TEXT,
+                "bg": bg if isinstance(bg, str) and HEX_COLOR_RE.match(bg) else "",
+            })
+        return rules
+    # 没有 log_rules：兼容上一版的 log_colors 字典，老用户改过的颜色不丢
+    colors = cfg.get("log_colors")
+    if isinstance(colors, dict):
+        for r in defaults:
+            v = colors.get(r["tag"])
+            if isinstance(v, str) and HEX_COLOR_RE.match(v):
+                r["fg"] = v
+    return defaults
 
 # 配置（串口、波特率、块大小这些记下来，下次打开不用重选）
 #
@@ -117,19 +198,11 @@ RE_READY = re.compile(rb"\[ota\]\s+ready,\s*app=(0x[0-9A-Fa-f]+),\s*page=(\d+)B"
                       rb"(?:\s*,\s*proto=(\d+))?")
 RE_PAGE  = re.compile(rb"\[ota\]\s+page\s+(0x[0-9A-Fa-f]+)\s+ok,\s*sum:\s*(\d+)")
 RE_TAIL  = re.compile(rb"\[ota\]\s+tail\s+(0x[0-9A-Fa-f]+)\s+(\d+)B\s+ok,\s*sum:\s*(\d+)")
-RE_ENTER = re.compile(rb"\[boot\]\s+enter\s+OTA")
-RE_JUMP  = re.compile(rb"\[boot\]\s+jump\s+to\s+app\s+(0x[0-9A-Fa-f]+)")
-RE_NOAPP = re.compile(rb"\[boot\]\s+no\s+valid\s+app")
-RE_RST   = re.compile(rb"\[rst\]\s+(\w+)")
-RE_OTAERR= re.compile(rb"\[ota\].*(?:FAIL|fail|error|ERR)")
-
 # proto=2 才开始有"尾部记录 + CRC 校验"，老版本没有这一段
 RE_TAILREC = re.compile(rb"\[ota\]\s+tail:\s*len=(\d+)\s+crc=0x([0-9A-Fa-f]+)")
 RE_VOK     = re.compile(rb"\[ota\]\s+verify\s+OK\s*(\d+)B")
 RE_VBAD    = re.compile(rb"\[ota\]\s+verify\s+FAIL")
 RE_SIZEBAD = re.compile(rb"\[ota\]\s+size\s+mismatch")
-RE_LEGACY  = re.compile(rb"\[boot\]\s+(?:no\s+param|legacy\s+mode)")
-RE_CRCBAD  = re.compile(rb"\[boot\]\s+crc\s+mismatch")
 
 
 def list_serial_ports():
@@ -289,30 +362,14 @@ def openocd_reset(exe, scr, interface="cmsis-dap", target="stm32f1x",
 # ==============================================================================
 # 协议打包（GUI 与无界面调试端 ota_headless.py 共用）
 # ==============================================================================
-# 抽成模块级函数，是因为这两个结构的字节定义必须和 C 端逐字节一致：
-#   OtaSlotHeader_t（32 字节，见 ota_slot.h）
+# 抽成模块级函数，是因为字节定义必须和 C 端逐字节一致：
 #   老协议尾部（12 字节，'OTAE' + len + crc32）
 # 一旦 GUI 里写一份、调试脚本里再写一份，两边漂移的症状是"发送说成功、
 # 板子报 crc mismatch"，而且不报任何错 —— 这类坑排查成本极高。
+# 2026-11-24：按用户要求移除「新架构」（App 直收 + FWUP 32 字节槽头）整条路径，
+# 连同 ota_headless.py 的 app-ota 模式一起删除；本工具不再有 FWUP 字节定义。
 
-OTA_HDR_MAGIC = 0x50555746      # 'F','W','U','P' 小端形式 = OTA_SLOT_HDR_MAGIC
-OTA_HDR_VER = 1                 # 必须等于 C 端 OTA_SLOT_HDR_VER
 OTA_TAIL_MAGIC = b"OTAE"
-
-
-def build_fwup_header(fw_ver, fw_len, fw_crc, build_time=0, flags=0):
-    """构造 32 字节槽头。
-
-    布局（必须和 OtaSlotHeader_t 一致）：
-      magic(I) fw_ver(H) hdr_ver(H) fw_len(I) fw_crc(I) build_time(I) flags(I)
-      = 24 字节；hdr_crc(I) 覆盖前 24 字节；reserved(I) 必须为 0
-
-    注意 CRC 覆盖的是 24 而不是 28 —— 28 是 hdr_crc 之后再算 reserved 的偏移，
-    很容易记混。C 端用 offsetof(hdr_crc) 算，这里必须跟着对上。
-    """
-    body = struct.pack("<IHHIIII", OTA_HDR_MAGIC, fw_ver, OTA_HDR_VER,
-                       fw_len, fw_crc, build_time, flags)
-    return body + struct.pack("<II", zlib.crc32(body) & 0xFFFFFFFF, 0)
 
 
 def build_ota_tail(fw_len, fw_crc):
@@ -330,6 +387,11 @@ class OtaSerialApp(object):
     def __init__(self, root):
         self.root = root
         self.cfg = load_config()
+
+        # 2026-11-24：规则表从配置读，非法颜色/非法 tag 名在 load_log_rules
+        # 里就挡掉了 —— Tk 收到坏颜色会在 tag_configure 抛 TclError，
+        # 界面直接起不来，不能让手改 json 把软件弄崩。
+        self.log_rules = load_log_rules(self.cfg)
 
         root.title("{}  v{}".format(APP_TITLE, APP_VER))
         root.geometry(self.cfg.get("geometry") or "1280x900")
@@ -362,39 +424,27 @@ class OtaSerialApp(object):
         # ---- 解析行缓冲 ----
         self.line_buf = b""
 
-        # ---- OTA 状态 ----
+        # ---- OTA 解析状态（原先挂在右侧 OTA 状态卡片上，卡片已移除）----
+        # 只保留发送流程真正依赖的数据：ota_saved / ota_proto / ota_verify
+        # 决定尾部记录发不发、何时复位；ota_done_ts 用来识别重启后重复的 ready。
+        # 纯显示用的字段与标签全部删掉，不再构造那块面板。
         self.ota_base = ""          # App 基址，如 0x08008000
         self.ota_page = ""          # 页大小，如 2048
         self.ota_saved = 0          # BootLoader 已确认落盘的字节数（sum）
         self.ota_proto = 1          # 协议版本：1 = 老版（无校验），2 = 支持尾部 + CRC
         self.ota_verify = None      # None 未出结果 / ("ok", 长度) / ("fail", 0)
         self.ota_declared = 0       # 尾部记录里声明的固件长度
-        self.ota_crc = ""           # 尾部记录里带的 CRC（字符串，仅显示用）
+        self.ota_crc = ""           # 尾部记录里带的 CRC（字符串）
         self.fw_size = 0            # 当前选中的固件文件大小
-        self.fw_verified = None     # None=未判定 True=一致 False=不一致
+        # 2026-11-24：选文件时记下 mtime，供「检查更新」按钮判断是否重新编译过。
+        # 初值 0 表示还没选文件；按钮此时是 disabled，不会被误用。
+        self.fw_mtime = 0.0
         self.ota_done_ts = 0.0      # 最近一次升级完成的时刻（0 = 还没跑过）
 
-        # ---- 调试器（DAP-Link 经 OpenOCD 复位）----
-        self.ocd_exe, self.ocd_scr = find_openocd()
-
-        # 调试器类型：配置里显式指定 > 现场探测 > 默认按 DAP-Link 猜。
-        # 换了 ST-Link / J-Link 不用改配置，探测会自己认出来。
-        _probed_iface, _probed_name = detect_debugger()
-        self.ocd_iface = (self.cfg.get("ocd_iface") or _probed_iface
-                          or "cmsis-dap")
-        self.ocd_target = self.cfg.get("ocd_target", "stm32f1x")
-        self.ocd_name = _probed_name or {
-            "cmsis-dap": "DAP-Link",
-            "stlink":    "ST-Link",
-            "jlink":     "J-Link",
-        }.get(self.ocd_iface, self.ocd_iface.upper())
-
-        # 接口脚本必须真的存在，否则 OpenOCD 一启动就报错，不如提前置灰
-        self.ocd_iface_ok = bool(
-            self.ocd_scr
-            and os.path.isfile(os.path.join(self.ocd_scr, "interface",
-                                            self.ocd_iface + ".cfg")))
-        self.ocd_ready = bool(self.ocd_exe) and self.ocd_iface_ok
+        # ---- 调试器（DAP-Link / ST-Link 经 OpenOCD 复位）----
+        # 2026-11-24：探测逻辑抽成 _probe_debugger()，「刷新软件」按钮复用。
+        # 原先写死在 __init__ 里，换调试器只能关窗重开才生效。
+        self._probe_debugger()
 
         # ---- 收发计数 ----
         self.rx_count = 0
@@ -417,6 +467,49 @@ class OtaSerialApp(object):
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._poll()
+
+    def _probe_debugger(self):
+        """重新探测 OpenOCD 与当前插着的调试器，只更新 self.ocd_* 数据。
+
+        2026-11-24：从 __init__ 抽出，供「刷新软件」复用。
+        注意配置里手写的 ocd_iface 优先于现场探测 —— 那是给"认错了"
+        留的逃生口，刷新时不能悄悄覆盖用户明确写下的选择。
+        """
+        self.ocd_exe, self.ocd_scr = find_openocd()
+
+        # 调试器类型：配置里显式指定 > 现场探测 > 默认按 DAP-Link 猜
+        _probed_iface, _probed_name = detect_debugger()
+        self.ocd_iface = (self.cfg.get("ocd_iface") or _probed_iface
+                          or "cmsis-dap")
+        self.ocd_target = self.cfg.get("ocd_target", "stm32f1x")
+        self.ocd_name = _probed_name or {
+            "cmsis-dap": "DAP-Link",
+            "stlink":    "ST-Link",
+            "jlink":     "J-Link",
+        }.get(self.ocd_iface, self.ocd_iface.upper())
+
+        # 接口脚本必须真的存在，否则 OpenOCD 一启动就报错，不如提前置灰
+        self.ocd_iface_ok = bool(
+            self.ocd_scr
+            and os.path.isfile(os.path.join(self.ocd_scr, "interface",
+                                            self.ocd_iface + ".cfg")))
+        self.ocd_ready = bool(self.ocd_exe) and self.ocd_iface_ok
+        return _probed_iface, _probed_name
+
+    def _apply_debugger_ui(self):
+        """把 ocd_* 状态同步到复位按钮和底部提示（探测完必须调一次）。
+
+        2026-11-24：从 _build_fw_card 抽出，刷新后不用重建控件就能更新。
+        """
+        if not self.ocd_exe:
+            self.ocd_hint.set("未找到 OpenOCD，请手动按板子复位")
+        elif not self.ocd_iface_ok:
+            self.ocd_hint.set("OpenOCD 缺 interface/{}.cfg，请手动复位".format(
+                self.ocd_iface))
+        else:
+            self.ocd_hint.set("SWD 复位就绪 · " + self.ocd_name)
+        self.lb_ocd_hint.configure(fg=C_OK if self.ocd_ready else C_BAD)
+        self.btn_rst.configure(state="normal" if self.ocd_ready else "disabled")
 
     # ---------------------------------------------------------------- ttk 主题
     def _init_style(self):
@@ -460,9 +553,6 @@ class OtaSerialApp(object):
                      font=(FONT_UI, 9, "bold"), padding=(10, 6), borderwidth=1)
         st.map("Stop.TButton",
                background=[("active", "#FBE4E2"), ("disabled", "#F0F0F0")])
-        st.configure("Ota.Horizontal.TProgressbar",
-                     troughcolor="#E7EBF1", background=C_OK,
-                     thickness=16, borderwidth=0)
 
     # ------------------------------------------------------------------- 布局
     def _build_ui(self):
@@ -500,6 +590,16 @@ class OtaSerialApp(object):
                                    command=self.toggle_port)
         self.btn_open.pack(side="left")
 
+        # 2026-11-24：软件内"软重启"，换调试器不用关窗再开。
+        # 和左边那个「刷新」区分开：那个只重扫串口，这个会断串口+清屏+
+        # 重新认调试器，等价于重开软件。
+        ttk.Button(bar, text="刷新软件", width=9,
+                   command=self.refresh_software).pack(side="left", padx=(10, 0))
+
+        # 2026-11-24：日志字色设置窗口，和「刷新软件」一样放左侧按钮组
+        ttk.Button(bar, text="设置", width=6,
+                   command=self.open_color_settings).pack(side="left", padx=(6, 0))
+
         # ---- 右侧显示选项（pack side=right 是从右往左排，注意顺序反着写）----
         self.disp_mode = tk.StringVar(value=self.cfg.get("disp_mode", "UTF-8"))
         cb_mode = ttk.Combobox(bar, textvariable=self.disp_mode, width=7,
@@ -517,7 +617,9 @@ class OtaSerialApp(object):
         self._chk(bar, "时间戳", self.timestamp, bg=C_BG).pack(
             side="right", padx=(0, 14))
 
-    # ---- 中部：接收区 + 右侧 OTA 面板 ----
+    # ---- 中部：接收区 + 右侧固件发送面板 ----
+    # OTA 状态卡片已按用户要求移除；BootLoader 日志仍由 _handle_line 解析，
+    # 发送流程依赖的状态照常维护，只是不再画到界面上。
     def _build_middle(self):
         mid = ttk.Frame(self.root)
         mid.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 6))
@@ -530,33 +632,322 @@ class OtaSerialApp(object):
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
 
+        # 接收区必须保持 normal 才能用鼠标/键盘选中文字复制。
+        # Tk 的 disabled Text 连选中都不允许（这正是红字日志复制不了的根因），
+        # 所以用 normal + 按键白名单：只放行导航/复制键，编辑键一律吞掉。
         self.rx = tk.Text(left, wrap="char", font=(FONT_MONO, 10),
                           bg="#FBFCFE", fg=C_TEXT, insertbackground=C_TEXT,
                           relief="solid", borderwidth=1,
                           padx=8, pady=6, spacing1=1, spacing3=1,
-                          undo=False, state="disabled")
+                          undo=False, state="normal")
         self.rx.grid(row=0, column=0, sticky="nsew")
+        self.rx.bind("<Key>", self._on_rx_key)
+
+        # 右键菜单：复制选中 / 复制全部日志，省得给智能体贴日志还要先手动全选
+        self.rx_menu = tk.Menu(self.root, tearoff=0, font=(FONT_UI, 9))
+        self.rx_menu.add_command(label="复制选中", command=self._copy_rx_selection)
+        self.rx_menu.add_command(label="复制全部日志", command=self._copy_all_rx)
+        self.rx_menu.add_separator()
+        self.rx_menu.add_command(label="全选", command=self._select_all_rx)
+        self.rx.bind("<Button-3>",
+                     lambda e: (self.rx_menu.tk_popup(e.x_root, e.y_root), "break")[1])
 
         sb = ttk.Scrollbar(left, orient="vertical", command=self.rx.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.rx.configure(yscrollcommand=sb.set)
 
-        # 着色规则
-        self.rx.tag_configure("boot", foreground=C_BOOT)
-        self.rx.tag_configure("ota", foreground=C_OTA)
-        self.rx.tag_configure("rst", foreground=C_WARN)
-        self.rx.tag_configure("good", foreground=C_OK)
-        self.rx.tag_configure("bad", background="#FDECEA", foreground=C_BAD)
-        self.rx.tag_configure("sys", foreground=C_SUB)
+        # 着色规则（红字只是文本 tag，不影响选中与复制）
+        # 2026-11-24：字色改为可配置，初值和「设置」保存走同一个函数。
+        self._apply_log_colors()
 
-        # ------- 右：OTA 面板 -------
+        # sel 必须显式提权：Tk 的 tag 优先级按创建顺序递增，内置的 sel 排在
+        # 用户标签之前，bad 的浅红背景会盖住选区高亮 —— 红字行"看着没选中"
+        # 的根因就在这里（选区其实已包含它，剪贴板能拿到）。
+        # 只设 background、不设 foreground：选中后仍按来源着色，便于分辨日志类型。
+        self.rx.tag_configure("sel", background="#0078D8")
+        self.rx.tag_raise("sel")
+
+        # ------- 右：只保留固件发送面板 -------
         # 不写死宽度，让右栏按内容自身需求占位。
         # 之前锁死 344px + grid_propagate(False)，一旦内容最小宽度超过它，
         # 控件就会被画到边界外、被窗口裁掉，而且极难察觉。
         right = ttk.Frame(mid)
         right.grid(row=0, column=1, sticky="ns", padx=(10, 0))
-        self._build_ota_card(right)
         self._build_fw_card(right)
+
+    def _apply_log_colors(self):
+        """把规则表里的颜色应用到接收区所有 tag。
+
+        2026-11-24：改为遍历 self.log_rules（含用户自定义规则）。
+        sel 每次都重新 tag_raise —— 新建 tag 会改变优先级顺序，
+        不提权的话坏行背景又会盖住选区高亮，回到"选中看不出来"的老问题。
+        """
+        for r in self.log_rules:
+            opts = {"foreground": r["fg"]}
+            if r["bg"]:
+                opts["background"] = r["bg"]
+            self.rx.tag_configure(r["tag"], **opts)
+        self.rx.tag_raise("sel")
+
+    def _clear_all_log_tags(self):
+        """清掉接收区所有日志 tag（保留 sel 选区）。
+
+        改规则后必须先把旧 tag 摘干净再按新规则重打 ——
+        否则删掉的规则残留、顺序变了的行还挂旧颜色，越改越乱。
+        """
+        for r in self.log_rules:
+            self.rx.tag_remove(r["tag"], "1.0", "end")
+        # 旧配置里可能有现在已删掉的 tag，也一并清（tag_names() 全量扫）
+        for t in self.rx.tag_names():
+            if t != "sel":
+                self.rx.tag_remove(t, "1.0", "end")
+
+    def _recolor_existing(self):
+        """按当前规则表重新给屏幕上已有行着色（确定设置后调用）。
+
+        工具提示行（sys）不参与匹配，靠文本前缀 "--- " 识别后直接挂 sys。
+        这是保守做法：用户日志里极少以 "--- " 开头，误判代价很低。
+        """
+        self._clear_all_log_tags()
+        total = int(self.rx.index("end-1c").split(".")[0])
+        for ln in range(1, total + 1):
+            a, b = "{}.0".format(ln), "{}.end".format(ln)
+            try:
+                line = self.rx.get(a, b)
+            except tk.TclError:
+                continue
+            if not line:
+                continue
+            if line.startswith("--- ") or line.startswith(">>> "):
+                self.rx.tag_add("sys", a, b)
+                continue
+            tag = self._classify(line)
+            if tag and tag != "sys":
+                self.rx.tag_add(tag, a, b)
+
+    def open_color_settings(self):
+        """规则设置窗口：增删改颜色规则、调优先级、实时预览、确定才落盘。
+
+        2026-11-24 重写。从"只能改六种固定字色"升级成规则表编辑器 ——
+        换工程时改规则即可，不用改代码重打包。
+        pending 是深拷贝的规则列表，取消/关窗不碰主界面；
+        确定后一次性应用（含给已显示的行重新着色）+ 写 json。
+        """
+        win = tk.Toplevel(self.root)
+        win.title("日志颜色规则")
+        win.configure(bg=C_BG)
+        win.resizable(False, False)
+        win.transient(self.root)
+        pending = [dict(r) for r in self.log_rules]   # 深拷贝，取消不影响主界面
+
+        # ---- 标题与说明 ----
+        head = tk.Frame(win, bg=C_BG)
+        head.pack(fill="x", padx=14, pady=(10, 6))
+        tk.Label(head, text="日志颜色规则（自上而下匹配，首命中即停）",
+                 bg=C_BG, fg=C_TEXT, font=(FONT_UI, 11, "bold")).pack(anchor="w")
+        tk.Label(head, text="关键词用 | 分隔多个，含任意一段即命中；顺序决定优先级，用 ↑↓ 调整",
+                 bg=C_BG, fg=C_SUB, font=(FONT_UI, 8)).pack(anchor="w", pady=(2, 0))
+
+        # ---- 规则列表（Treeview）----
+        tw = ttk.Treeview(win, columns=("name", "pattern", "color"),
+                          show="headings", height=8)
+        tw.heading("name", text="规则名")
+        tw.heading("pattern", text="关键词（| 分隔）")
+        tw.heading("color", text="字色 / 底色")
+        tw.column("name", width=110, anchor="w")
+        tw.column("pattern", width=190, anchor="w")
+        tw.column("color", width=130, anchor="w")
+        tw.pack(fill="x", padx=14)
+        for r in pending:
+            tw.insert("", "end", values=(r["name"], r["pattern"] or "（不匹配，仅提示色）",
+                                         r["fg"] + ((" / " + r["bg"]) if r["bg"] else "")))
+
+        pv = tk.Text(win, height=5, wrap="none", font=(FONT_MONO, 9),
+                     bg="#FBFCFE", fg=C_TEXT, relief="solid", borderwidth=1,
+                     padx=8, pady=4, state="normal")
+        pv.pack(fill="x", padx=14, pady=(8, 2))
+
+        def paint_preview():
+            """预览区：每条规则给一行示例文字，按 pending 的颜色着色。"""
+            pv.configure(state="normal")
+            pv.delete("1.0", "end")
+            for r in pending:
+                # 示例行：取第一个关键词拼一句，sys 用工具提示示例
+                kw = (r["pattern"].split("|")[0].strip() if r["pattern"] else "")
+                sample = ("--- 系统提示：已连接 COM25 @ 115200 ---" if r["tag"] == "sys"
+                          else "示例 [{}] {}".format(r["tag"], kw or "日志内容"))
+                pv.insert("end", sample + "\n")
+                pv.tag_configure(r["tag"], foreground=r["fg"],
+                                 background=r["bg"] if r["bg"] else "")
+                pv.tag_add(r["tag"], "end-2l", "end-1l")
+            pv.tag_configure("sel", background="#0078D8")
+            pv.tag_raise("sel")
+            pv.configure(state="disabled")
+
+        def selected_idx():
+            sel = tw.selection()
+            if not sel:
+                return None
+            return tw.index(sel[0])
+
+        def refresh_list(keep=None):
+            tw.delete(*tw.get_children())
+            for r in pending:
+                tw.insert("", "end", values=(
+                    r["name"], r["pattern"] or "（不匹配，仅提示色）",
+                    r["fg"] + ((" / " + r["bg"]) if r["bg"] else "")))
+            kids = tw.get_children()
+            if kids:
+                idx = keep if keep is not None and keep < len(kids) else 0
+                tw.selection_set(kids[idx])
+            paint_preview()
+
+        def edit_selected():
+            """编辑选中的规则：名称/关键词/颜色/底色。"""
+            i = selected_idx()
+            if i is None:
+                messagebox.showinfo("未选中", "请先在列表里点一条规则。", parent=win)
+                return
+            r = pending[i]
+            dlg = tk.Toplevel(win)
+            dlg.title("编辑规则 · " + r["name"])
+            dlg.configure(bg=C_BG)
+            dlg.resizable(False, False)
+            dlg.transient(win)
+            f = tk.Frame(dlg, bg=C_BG)
+            f.pack(padx=16, pady=14)
+            tk.Label(f, text="规则名", bg=C_BG, fg=C_TEXT,
+                     font=(FONT_UI, 9)).grid(row=0, column=0, sticky="w", pady=3)
+            name_e = tk.Entry(f, font=(FONT_UI, 9), width=26)
+            name_e.insert(0, r["name"])
+            name_e.grid(row=0, column=1, pady=3)
+            tk.Label(f, text="关键词", bg=C_BG, fg=C_TEXT,
+                     font=(FONT_UI, 9)).grid(row=1, column=0, sticky="w", pady=3)
+            pat_e = tk.Entry(f, font=(FONT_MONO, 9), width=26)
+            pat_e.insert(0, r["pattern"])
+            pat_e.grid(row=1, column=1, pady=3)
+            tk.Label(f, text="（sys 规则留空，不参与匹配）", bg=C_BG, fg=C_SUB,
+                     font=(FONT_UI, 8)).grid(row=2, column=1, sticky="w")
+
+            fg_var = tk.StringVar(value=r["fg"])
+            bg_var = tk.StringVar(value=r["bg"] or "（无）")
+            tk.Label(f, text="字色", bg=C_BG, fg=C_TEXT,
+                     font=(FONT_UI, 9)).grid(row=3, column=0, sticky="w", pady=3)
+            fg_btn = tk.Button(f, text="   ", bg=r["fg"], relief="ridge", bd=1,
+                               width=3, cursor="hand2")
+            fg_btn.grid(row=3, column=1, sticky="w")
+            tk.Label(f, textvariable=fg_var, bg=C_BG, fg=C_SUB,
+                     font=(FONT_MONO, 9)).grid(row=3, column=2, sticky="w", padx=(6, 0))
+            tk.Label(f, text="底色", bg=C_BG, fg=C_TEXT,
+                     font=(FONT_UI, 9)).grid(row=4, column=0, sticky="w", pady=3)
+            bg_btn = tk.Button(f, text="   ", bg=r["bg"] or C_PANEL, relief="ridge",
+                               bd=1, width=3, cursor="hand2")
+            bg_btn.grid(row=4, column=1, sticky="w")
+
+            def pick(which):
+                cur = r["fg"] if which == "fg" else (r["bg"] or C_PANEL)
+                c = colorchooser.askcolor(initialcolor=cur, parent=dlg,
+                                          title="选择" + ("字色" if which == "fg" else "底色"))
+                if c and c[1]:
+                    if which == "fg":
+                        fg_var.set(c[1].upper()); fg_btn.configure(bg=c[1])
+                    else:
+                        bg_var.set(c[1].upper()); bg_btn.configure(bg=c[1])
+
+            fg_btn.configure(command=lambda: pick("fg"))
+            bg_btn.configure(command=lambda: pick("bg"))
+
+            def no_bg():
+                bg_var.set("（无）"); bg_btn.configure(bg=C_PANEL)
+
+            tk.Button(f, text="底色设为无", font=(FONT_UI, 8),
+                      command=no_bg).grid(row=4, column=2, sticky="w", padx=(6, 0))
+
+            def save_edit():
+                r["name"] = name_e.get().strip() or r["tag"]
+                r["pattern"] = pat_e.get().strip()
+                r["fg"] = fg_var.get() if HEX_COLOR_RE.match(fg_var.get()) else r["fg"]
+                r["bg"] = bg_var.get() if HEX_COLOR_RE.match(bg_var.get()) else ""
+                dlg.destroy()
+                refresh_list(i)
+
+            btns = tk.Frame(f, bg=C_BG)
+            btns.grid(row=5, column=0, columnspan=3, pady=(12, 0))
+            ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right", padx=(6, 0))
+            ttk.Button(btns, text="保存", style="Accent.TButton",
+                       command=save_edit).pack(side="right")
+            dlg.grab_set()
+
+        def add_rule():
+            n = 1
+            used = {r["tag"] for r in pending}
+            while "custom{}".format(n) in used:
+                n += 1
+            pending.append({"tag": "custom{}".format(n), "name": "新规则{}".format(n),
+                            "pattern": "", "fg": C_ACCENT, "bg": ""})
+            refresh_list(len(pending) - 1)
+
+        def del_rule():
+            """删除选中规则 —— 2026-11-24 晚：全部规则一视同仁，包括默认六条。
+
+            不需要确认弹窗：取消/关窗都不会落盘，误删只要不点确定就没影响；
+            真删错了点「恢复默认」能一键找回（或按原来重新加一条）。
+            """
+            i = selected_idx()
+            if i is None:
+                return
+            del pending[i]
+            refresh_list(min(i, len(pending) - 1) if pending else None)
+
+        def move(delta):
+            i = selected_idx()
+            if i is None:
+                return
+            j = i + delta
+            if j < 0 or j >= len(pending):
+                return
+            pending[i], pending[j] = pending[j], pending[i]
+            refresh_list(j)
+
+        # ---- 操作按钮行 ----
+        ops = tk.Frame(win, bg=C_BG)
+        ops.pack(fill="x", padx=14, pady=(6, 2))
+        ttk.Button(ops, text="新增", command=add_rule).pack(side="left")
+        ttk.Button(ops, text="编辑", command=edit_selected).pack(side="left", padx=(6, 0))
+        ttk.Button(ops, text="删除", command=del_rule).pack(side="left", padx=(6, 0))
+        ttk.Button(ops, text="↑ 上移", command=lambda: move(-1)).pack(side="left", padx=(6, 0))
+        ttk.Button(ops, text="↓ 下移", command=lambda: move(1)).pack(side="left", padx=(6, 0))
+        tw.bind("<Double-1>", lambda e: edit_selected())
+
+        # ---- 底部按钮 ----
+        bar = tk.Frame(win, bg=C_BG)
+        bar.pack(fill="x", padx=14, pady=(6, 12))
+
+        def restore_defaults():
+            pending[:] = default_log_rules()
+            refresh_list(0)
+
+        def apply_and_close():
+            # 确定才动主界面：换规则表 → 重设 tag → 给已显示的行重着色 → 落盘
+            self.log_rules = [dict(r) for r in pending]
+            self._apply_log_colors()
+            self._recolor_existing()
+            self.cfg["log_rules"] = [dict(r) for r in pending]
+            save_config(self.cfg)
+            self._sys_line("--- 日志颜色规则已更新 ---")
+            win.destroy()
+
+        ttk.Button(bar, text="恢复默认", command=restore_defaults).pack(side="left")
+        ttk.Button(bar, text="取消", command=win.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(bar, text="确定", style="Accent.TButton",
+                   command=apply_and_close).pack(side="right")
+
+        paint_preview()
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+        win.geometry("+{}+{}".format(max(x, 0), max(y, 0)))
+        win.grab_set()
 
     def _chk(self, parent, text, var, bg=None):
         """普通 Tk 复选框。
@@ -593,55 +984,26 @@ class OtaSerialApp(object):
         content.columnconfigure(1, weight=1)
         return content
 
-    def _build_ota_card(self, parent):
-        c = self._card(parent, "OTA 状态", 0)
-
-        # 状态灯 + 文字
-        line0 = tk.Frame(c, bg=C_PANEL)
-        line0.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        self.lamp = tk.Canvas(line0, width=10, height=10, bg=C_PANEL,
-                              highlightthickness=0)
-        self.lamp.pack(side="left", padx=(0, 6))
-        self.lamp_id = self.lamp.create_oval(1, 1, 9, 9,
-                                             fill="#C9CFD8", outline="")
-        self.var_state = tk.StringVar(value="未连接")
-        tk.Label(line0, textvariable=self.var_state, bg=C_PANEL, fg=C_SUB,
-                 font=(FONT_UI, 9, "bold")).pack(side="left")
-
-        def kv_row(r, key, var, mono=True):
-            tk.Label(c, text=key, bg=C_PANEL, fg=C_SUB,
-                     font=(FONT_UI, 8)).grid(row=r, column=0, sticky="w")
-            tk.Label(c, textvariable=var, bg=C_PANEL, fg=C_TEXT,
-                     font=(FONT_MONO, 9) if mono else (FONT_UI, 9),
-                     anchor="e").grid(row=r, column=1, sticky="e")
-
-        self.var_app = tk.StringVar(value="--")
-        self.var_page = tk.StringVar(value="--")
-        self.var_saved = tk.StringVar(value="0 B")
-        self.var_target = tk.StringVar(value="未选择固件")
-        kv_row(1, "App 基址", self.var_app)
-        kv_row(2, "页大小", self.var_page)
-        kv_row(3, "已落盘", self.var_saved)
-        kv_row(4, "目标大小", self.var_target, mono=False)
-
-        self.pb = ttk.Progressbar(c, style="Ota.Horizontal.TProgressbar",
-                                  maximum=100, value=0)
-        self.pb.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 3))
-
-        self.var_verify = tk.StringVar(value="")
-        self.lb_verify = tk.Label(c, textvariable=self.var_verify, bg=C_PANEL,
-                                  fg=C_SUB, font=(FONT_UI, 9, "bold"),
-                                  anchor="w")
-        self.lb_verify.grid(row=6, column=0, columnspan=2, sticky="ew")
-
     def _build_fw_card(self, parent):
-        c = self._card(parent, "固件发送", 1)
+        # OTA 状态卡片移除后，固件发送面板上移到第 0 行。
+        c = self._card(parent, "固件发送", 0)
 
         self.fw_path = tk.StringVar(value="")
         self.fw_name = tk.StringVar(value="（未选择文件）")
 
-        ttk.Button(c, text="选择 .bin 文件", command=self.pick_file).grid(
-            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        # 2026-11-24：选文件 + 检查更新并排。检查按钮只对比当前选中 bin 的
+        # mtime/size，变了就自动重新装填（用户确认过不要弹窗打断）。
+        bf_pick = tk.Frame(c, bg=C_PANEL)
+        bf_pick.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        bf_pick.columnconfigure(0, weight=2)
+        bf_pick.columnconfigure(1, weight=1)
+        ttk.Button(bf_pick, text="选择 .bin 文件",
+                   command=self.pick_file).grid(row=0, column=0, sticky="ew",
+                                                padx=(0, 3))
+        self.btn_chk_fw = ttk.Button(bf_pick, text="检查更新", width=8,
+                                     command=self.check_fw_update)
+        self.btn_chk_fw.grid(row=0, column=1, sticky="ew")
+        self.btn_chk_fw.configure(state="disabled")   # 没选文件时不可用
 
         tk.Label(c, textvariable=self.fw_name, bg=C_PANEL, fg=C_SUB,
                  font=(FONT_UI, 8), wraplength=288, justify="left",
@@ -671,33 +1033,13 @@ class OtaSerialApp(object):
         self.chk_reset.grid(row=4, column=0, columnspan=2, sticky="w",
                             pady=(6, 2))
 
-        # 新架构开关：固件不再由 BootLoader 收，而是直接发给正在运行的 App。
-        # App 自己写 W25Q 槽 A、收完写头、然后软复位回 BootLoader 搬运。
-        # 默认关：老工具配老流程仍然可用，切换是显式动作，不做隐式猜测。
-        # 放在"发送前复位"紧下方，因为这两项是互斥的两条发送路径 ——
-        # 勾了新架构就不需要抢 OTA 窗口，所以联动置灰，避免误以为还要复位。
-        self.fwup_mode = tk.BooleanVar(value=self.cfg.get("fwup_mode", False))
-        self.chk_fwup = self._chk(c, "新架构：直接发给 App（FWUP 头，免复位）",
-                                  self.fwup_mode)
-        self.chk_fwup.grid(row=5, column=0, columnspan=2, sticky="w",
-                           pady=(0, 2))
-
-        # 固件版本号：写进 FWUP 头 → App 原样存进槽头 → Boot 搬进参数页。
-        # Boot 拿它和"板子当前版本"比，低于就拒绝搬运 —— 这是拦误刷旧版的唯一手段
-        # （CRC 不行：同一份源码重编一次，__TIME__ 变了 CRC 就变，分不出新旧）。
-        # 只在新架构下有意义：老协议没有头部，Boot 那边也读不到版本。
-        vf = tk.Frame(c, bg=C_PANEL)
-        vf.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 5))
-        vf.columnconfigure(0, weight=1)
-        tk.Label(vf, text="固件版本（升序，降级会被拒绝）", bg=C_PANEL, fg=C_SUB,
-                 font=(FONT_UI, 8)).grid(row=0, column=0, sticky="w")
-        self.fw_ver_var = tk.StringVar(value=str(self.cfg.get("fw_ver", "1")))
-        ttk.Spinbox(vf, textvariable=self.fw_ver_var, from_=1, to=65535,
-                    width=7, font=(FONT_MONO, 9)).grid(row=0, column=1, sticky="e")
+        # 2026-11-24：按用户要求移除「新架构」开关及其固件版本号输入。
+        # 发送现在固定走 BootLoader 老协议：SWD 抢窗口 → 裸流 → OTAE 尾 → 等板子校验跳转。
+        # 副作用：不再支持 App 直收 FWUP 槽头的路径，相关配置键也不再写入。
 
         # 发送 / 中止
         bf = tk.Frame(c, bg=C_PANEL)
-        bf.grid(row=7, column=0, columnspan=2, sticky="ew")
+        bf.grid(row=5, column=0, columnspan=2, sticky="ew")
         bf.columnconfigure(0, weight=2)
         bf.columnconfigure(1, weight=1)
 
@@ -714,13 +1056,13 @@ class OtaSerialApp(object):
         self.var_tx = tk.StringVar(value="")
         tk.Label(c, textvariable=self.var_tx, bg=C_PANEL, fg=C_SUB,
                  font=(FONT_MONO, 8), anchor="w").grid(
-            row=8, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+            row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0))
 
         # 复位：DAP-Link 的串口 DTR 不接 NRST，必须走 SWD。
         # width 单位是字符，必须限死，否则 ttk 按钮按文字撑出 147px 最小宽度、
         # 把卡片顶宽，右对齐的控件会被画到窗口外且 winfo 量不出来。
         rf = tk.Frame(c, bg=C_PANEL)
-        rf.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        rf.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         rf.columnconfigure(0, weight=2)
         rf.columnconfigure(1, weight=1)
 
@@ -733,35 +1075,15 @@ class OtaSerialApp(object):
         ttk.Button(rf, text="唤醒", width=5, command=self.wake_ota).grid(
             row=0, column=1, sticky="ew")
 
-        # 调试器状态一行说明，找不到时告诉用户原因
+        # 调试器状态一行说明，找不到时告诉用户原因。
+        # 2026-11-24：label 存引用，刷新后由 _apply_debugger_ui 改文字/颜色；
+        # 复位按钮的可用性也归它管，两处状态不能各写一份。
         self.ocd_hint = tk.StringVar()
-        if not self.ocd_exe:
-            self.ocd_hint.set("未找到 OpenOCD，请手动按板子复位")
-        elif not self.ocd_iface_ok:
-            self.ocd_hint.set("OpenOCD 缺 interface/{}.cfg，请手动复位".format(
-                self.ocd_iface))
-        else:
-            self.ocd_hint.set("SWD 复位就绪 · " + self.ocd_name)
-        tk.Label(c, textvariable=self.ocd_hint, bg=C_PANEL,
-                 fg=C_OK if self.ocd_ready else C_BAD,
-                 font=(FONT_UI, 7), anchor="w").grid(
-            row=10, column=0, columnspan=2, sticky="ew", pady=(3, 0))
-
-        # 两条路径互斥：新架构下"发送前复位"没意义（App 本来就活着），
-        # 置灰比留着一个勾更容易让人看懂当前走哪条。取消勾选后恢复可用。
-        self.fwup_mode.trace_add("write", lambda *_: self._sync_send_mode())
-        self._sync_send_mode()
-
-    def _sync_send_mode(self):
-        """勾了「新架构」就把「发送前复位」置灰，反之恢复。
-
-        只是让界面说真话：新架构的发送函数根本不读 auto_reset，
-        留着可勾选框会让人以为复位还在起作用。
-        """
-        if self.fwup_mode.get():
-            self.chk_reset.configure(state="disabled")
-        else:
-            self.chk_reset.configure(state="normal")
+        self.lb_ocd_hint = tk.Label(c, textvariable=self.ocd_hint, bg=C_PANEL,
+                                    font=(FONT_UI, 7), anchor="w")
+        self.lb_ocd_hint.grid(row=8, column=0, columnspan=2, sticky="ew",
+                              pady=(3, 0))
+        self._apply_debugger_ui()
 
     # ---- 底部：发送区 ----
     def _build_sendbar(self):
@@ -827,6 +1149,65 @@ class OtaSerialApp(object):
     # ==========================================================================
     # 串口开关
     # ==========================================================================
+
+    def refresh_software(self):
+        """软件内"软重启"：断串口、清屏、重新认调试器、重扫串口。
+
+        2026-11-24 新增。起因：调试器只在 __init__ 探测一次，换 DAP-Link /
+        ST-Link 后必须关窗重开，否则 SWD 复位还按旧 interface 脚本走。
+        这里把重开窗口才会重做的事做一遍，省掉一次完整重启。
+
+        副作用（和真重启一致，用户已确认要"整个软件刷新"）：
+          · 已连接的串口会被断开（换调试器通常也要换线，留着没意义）
+          · 接收区日志、OTA 解析状态、收发计数全部清零
+          · 正在发送的固件会被中止
+        保留：固件路径、窗口位置、所有配置勾选 —— 真重启也是从 json 恢复它们。
+        """
+        # 1) 先停发送和接收线程，再断串口；顺序反了线程会对着 None 写
+        if self.tx_thread and self.tx_thread.is_alive():
+            self.abort_evt.set()
+        if self.ser and self.ser.is_open:
+            self.close_port()
+        self.btn_go.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+
+        # 2) 清屏并重置所有和"新开一个窗口"等价的运行时状态
+        self.clear_rx()
+        self.line_buf = b""
+        self.dec_utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+        self.dec_gbk = codecs.getincrementaldecoder("gbk")("replace")
+        self.rx_count = 0
+        self.tx_count = 0
+        self._update_counts()
+        self.var_tx.set("")
+        self.ota_base = ""
+        self.ota_page = ""
+        self.ota_saved = 0
+        self.ota_proto = 1
+        self.ota_verify = None
+        self.ota_declared = 0
+        self.ota_crc = ""
+        self.ota_done_ts = 0.0
+
+        # 3) 重新探测调试器并同步按钮/提示 —— 这是本功能的核心目的
+        probed_iface, probed_name = self._probe_debugger()
+        self._apply_debugger_ui()
+
+        # 4) 串口列表也重扫一遍（换调试器时 COM 号可能跟着变）
+        self.refresh_ports()
+
+        # 5) 写一条可见的回执，免得用户不确定到底刷没刷
+        self._sys_line("--- 已刷新软件：串口已断开，日志与状态已重置 ---")
+        if self.cfg.get("ocd_iface"):
+            self._sys_line("--- 调试器：配置锁定 interface/{}（改配置才会变）---".format(
+                self.ocd_iface))
+        elif probed_name:
+            self._sys_line("--- 调试器：{} → interface/{}.cfg，SWD 复位{} ---".format(
+                probed_name, self.ocd_iface,
+                "就绪" if self.ocd_ready else "不可用（检查 OpenOCD/脚本）"))
+        else:
+            self._sys_line("--- 调试器：未识别到在位的 DAP/ST/J-Link，"
+                           "SWD 复位不可用，可手动按复位键 ---")
 
     def refresh_ports(self):
         ports = list_serial_ports()
@@ -907,7 +1288,6 @@ class OtaSerialApp(object):
 
         self.btn_open.configure(text="关闭串口")
         self.var_conn.set("已连接  {}  {}".format(dev, baud))
-        self._set_state("已连接", C_ACCENT)
         self._sys_line("--- 已连接 {} @ {} ---".format(dev, baud))
 
     def close_port(self):
@@ -927,7 +1307,6 @@ class OtaSerialApp(object):
 
         self.btn_open.configure(text="打开串口")
         self.var_conn.set("未连接")
-        self._set_state("未连接", "#C9CFD8")
         self._sys_line("--- 已断开 ---")
 
     def _reader_loop(self):
@@ -1035,34 +1414,87 @@ class OtaSerialApp(object):
 
     def _insert(self, s, tag=None):
         at_end = self.rx.yview()[1] > 0.999
-        self.rx.configure(state="normal")
+        # 不再切 state：Text 保持 normal 才能选中复制，编辑键由 _on_rx_key 拦截。
         self.rx.insert("end", s, tag or ())
         # 超量裁剪，保证长时间开着也不吃内存
         total = int(self.rx.index("end-1c").split(".")[0])
         if total > self.rx_max_lines:
             self.rx.delete("1.0", "{}.0".format(total - self.rx_max_lines + 500))
-        self.rx.configure(state="disabled")
         if self.autoscroll.get() or at_end:
             self.rx.see("end")
 
     def _sys_line(self, s):
+        # 工具提示行固定挂 "sys" tag。若用户在设置里删掉了 sys 规则，
+        # Tk 对未配置的 tag 名只是不着色（不会抛异常），显示默认字色 ——
+        # 这是"全部规则可删"的预期结果，不必在这里补规则。
         self._insert(s + "\n", "sys")
 
-    @staticmethod
-    def _classify(line):
+    # 接收区只读但可选中：按键白名单 + 右键复制
+    # ------------------------------------------------------------------
+    _RX_NAV_KEYS = frozenset((
+        "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+        "Caps_Lock", "Num_Lock", "Escape",
+    ))
+
+    def _on_rx_key(self, event):
+        """接收区保持 normal 可复制，同时不让用户改动日志。
+
+        返回 "break" 会让 Tk 停止继续处理该按键。导航键（含 Shift+方向
+        扩展选区）永远放行；Control 只放行复制/全选/清屏和 Ctrl+Insert，
+        其余包括 BackSpace、Delete、Ctrl+V 一律吞掉。
+        """
+        if event.keysym in self._RX_NAV_KEYS:
+            return None
+        if event.state & 0x0004:            # Control 修饰位
+            if event.keysym.lower() in ("c", "a", "l") or event.keysym == "Insert":
+                return None
+            return "break"
+        return "break"
+
+    def _copy_rx_selection(self):
+        """右键「复制选中」：没有选区时静默返回，不弹框打扰。"""
+        try:
+            txt = self.rx.get("sel.first", "sel.last")
+        except tk.TclError:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+
+    def _copy_all_rx(self):
+        """右键「复制全部日志」：整屏文本进剪贴板，方便直接贴给智能体分析。"""
+        txt = self.rx.get("1.0", "end-1c")
+        if not txt:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+
+    def _select_all_rx(self):
+        """全选接收区，供用户自行决定复制哪一段。"""
+        self.rx.tag_add("sel", "1.0", "end")
+        self.rx.mark_set("insert", "end")
+
+    def _classify(self, line):
+        """按规则表给一行日志选 tag：从上到下，首命中即停。
+
+        2026-11-24：从硬编码六种改成规则驱动。pattern 里的 | 是「或」，
+        每段作为一个子串去找；sys 规则的 pattern 为空，不参与匹配
+        （工具提示行是 _sys_line 直接挂 tag 的）。
+
+        注意顺序敏感：FAIL 必须排在 ok 前面，否则 "verify FAIL"
+        会先被 " OK" 之类命中染绿。规则表支持上下移动就是为了调这个。
+        """
         s = line.strip()
         if not s:
             return None
-        if "FAIL" in s or "ERROR" in s or "error" in s:
-            return "bad"
-        if s.startswith("[boot]"):
-            return "boot"
-        if s.startswith("[ota]"):
-            return "ota"
-        if s.startswith("[rst]"):
-            return "rst"
-        if " ok" in s or s.endswith("ok") or "OK" in s:
-            return "good"
+        for r in self.log_rules:
+            pat = r.get("pattern", "")
+            if not pat:
+                continue                     # sys 或空规则
+            for kw in pat.split("|"):
+                kw = kw.strip()
+                if kw and kw in s:
+                    return r["tag"]
         return None
 
     def on_disp_mode_change(self):
@@ -1091,9 +1523,7 @@ class OtaSerialApp(object):
         副作用：HEX 模式下偏移从 00000000 重新起算。不归零的话清屏后
         第一行会接着上一屏的地址，看起来像丢了一段，反而更迷惑。
         """
-        self.rx.configure(state="normal")
         self.rx.delete("1.0", "end")
-        self.rx.configure(state="disabled")
         self.hex_buf = b""
         self.hex_off = 0
 
@@ -1117,7 +1547,7 @@ class OtaSerialApp(object):
             messagebox.showerror("保存失败", str(e))
 
     # ==========================================================================
-    # BootLoader 日志解析 → 更新 OTA 面板
+    # BootLoader 日志解析 → 内部状态（OTA 面板已移除）
     # ==========================================================================
 
     def _feed_parser(self, data):
@@ -1131,61 +1561,44 @@ class OtaSerialApp(object):
             self.line_buf = self.line_buf[-1024:]
 
     def _handle_line(self, line):
+        """从串口日志里提取发送流程需要的状态，不再更新任何界面控件。
+
+        OTA 状态卡片移除后，这里只保留会影响发送决策的数据：
+        ota_saved（老协议等落盘）、ota_proto（决定发不发尾部）、
+        ota_verify / ota_done_ts（校验结论与重启识别）。其它日志行保持
+        原样显示在接收区，用户仍可选中复制。
+        """
         if not line:
             return
 
         m = RE_READY.search(line)
         if m:
             # 升级完成后会自动复位，重启的 BootLoader 又打一遍 [ota] ready。
-            # 这一次不能把统计清零 —— 否则界面上会出现
-            # 「已落盘 14,868 B → 0 B」，看着像升级失败。
+            # 这一次不能清 ota_saved —— 老协议的"等 sum 对齐再复位"会永远等不到。
             just_done = (time.time() - self.ota_done_ts) < 15.0
             self.ota_base = m.group(1).decode()
             self.ota_page = m.group(2).decode()
             # proto 是可选组：老 BootLoader 不打这个字段，就是 1
             self.ota_proto = int(m.group(3)) if m.group(3) else 1
-            self.var_app.set(self.ota_base)
-            self.var_page.set(self.ota_page + " B")
             if not just_done:
                 self.ota_saved = 0
-                self.var_saved.set("0 B")
-                self._set_state("等待固件", C_ACCENT)
-            else:
-                self._set_state("升级完成，重启中…", C_OK)
-            self._update_progress()
-            self._update_verify()
-            return
-
-        m = RE_ENTER.search(line)
-        if m:
-            self._set_state("已进入 OTA，接收中…", C_WARN)
             return
 
         m = RE_PAGE.search(line)
         if m:
             self.ota_saved = int(m.group(2))
-            self.var_saved.set("{:,} B".format(self.ota_saved))
-            self._set_state("写入中…", C_WARN)
-            self._update_progress()
-            self._update_verify()
             return
 
         m = RE_TAIL.search(line)
         if m:
             self.ota_saved = int(m.group(3))
             self.ota_done_ts = time.time()      # 记时刻，后面重启的 ready 不会清统计
-            self.var_saved.set("{:,} B".format(self.ota_saved))
-            self.pb.configure(value=100)
-            self._update_verify()
-            self._set_state("写入完成", C_OK)
-            self._flash_lamp(C_OK)
             return
 
         m = RE_TAILREC.search(line)
         if m:
             self.ota_declared = int(m.group(1))
             self.ota_crc = m.group(2).decode().upper()
-            self._set_state("收到尾部记录，校验中…", C_ACCENT)
             return
 
         m = RE_VOK.search(line)
@@ -1194,104 +1607,12 @@ class OtaSerialApp(object):
             self.ota_verify = ("ok", n)
             self.ota_saved = n
             self.ota_done_ts = time.time()
-            self.var_saved.set("{:,} B".format(n))
-            self.pb.configure(value=100)
-            self._update_verify()
-            self._set_state("CRC 校验通过，跳转中…", C_OK)
-            self._flash_lamp(C_OK)
             return
 
         if RE_VBAD.search(line) or RE_SIZEBAD.search(line):
             # 校验没过就别指望跳转了，板子还停在 OTA 里等重传
             self.ota_verify = ("fail", 0)
-            self._update_verify()
-            self._set_state("校验失败，未跳转", C_BAD)
-            self._flash_lamp(C_BAD)
             return
-
-        if RE_CRCBAD.search(line):
-            self._set_state("固件 CRC 不匹配，停在 OTA", C_BAD)
-            return
-
-        if RE_LEGACY.search(line):
-            # 参数页空的：这份 App 是加校验之前刷的，能用但没验证过
-            self._set_state("老固件：未校验", C_WARN)
-            return
-
-        m = RE_JUMP.search(line)
-        if m:
-            self.var_app.set(m.group(1).decode())
-            self._set_state("已跳转 App", C_OK)
-            return
-
-        m = RE_NOAPP.search(line)
-        if m:
-            self._set_state("无有效 App，等待固件", C_WARN)
-            return
-
-        if RE_OTAERR.search(line):
-            self._set_state("写入出错", C_BAD)
-            self._flash_lamp(C_BAD)
-            return
-
-        m = RE_RST.search(line)
-        if m:
-            cause = m.group(1).decode()
-            if cause in ("IWDG", "WWDG"):
-                self._set_state("看门狗复位！", C_BAD)
-            return
-
-    def _update_progress(self):
-        if self.fw_size > 0:
-            pct = min(100.0, self.ota_saved * 100.0 / self.fw_size)
-            self.pb.configure(value=pct)
-        elif self.ota_saved > 0:
-            # 不知道目标大小，就按 100KB 做相对刻度（仅示意）
-            self.pb.configure(value=min(100.0, self.ota_saved / 1024.0))
-
-    def _update_verify(self):
-        """把 BootLoader 报的 sum 和文件大小对一下账 —— OTA 最容易出问题的地方"""
-        # 有 CRC 结论时以它为准：字节数对上不代表内容对
-        if self.ota_verify is not None:
-            kind, n = self.ota_verify
-            if kind == "ok":
-                self.var_verify.set("✓ CRC 校验通过 ({:,} B)".format(n))
-                self.lb_verify.configure(fg=C_OK)
-            else:
-                self.var_verify.set("✗ CRC 校验失败，未跳转")
-                self.lb_verify.configure(fg=C_BAD)
-            return
-
-        if self.fw_size <= 0 or self.ota_saved <= 0:
-            self.var_verify.set("")
-            self.lb_verify.configure(fg=C_SUB)
-            return
-
-        if self.ota_saved == self.fw_size:
-            self.var_verify.set("✓ 字节数一致 ({:,} B)".format(self.ota_saved))
-            self.lb_verify.configure(fg=C_OK)
-        elif self.ota_saved < self.fw_size:
-            self.var_verify.set("✗ 少 {} B".format(self.fw_size - self.ota_saved))
-            self.lb_verify.configure(fg=C_BAD)
-        else:
-            self.var_verify.set("✗ 多出 {} B".format(self.ota_saved - self.fw_size))
-            self.lb_verify.configure(fg=C_BAD)
-
-    def _set_state(self, text, color):
-        self.var_state.set(text)
-        self.lamp.itemconfigure(self.lamp_id, fill=color)
-
-    def _flash_lamp(self, color):
-        """完成/出错时闪三下，眼睛容易注意到"""
-        def blink(n):
-            if n <= 0:
-                self.lamp.itemconfigure(self.lamp_id, fill=color)
-                return
-            cur = self.lamp.itemcget(self.lamp_id, "fill")
-            self.lamp.itemconfigure(self.lamp_id,
-                                    fill="#FFFFFF" if cur == color else color)
-            self.root.after(180, lambda: blink(n - 1))
-        blink(6)
 
     # ==========================================================================
     # 普通发送
@@ -1385,27 +1706,77 @@ class OtaSerialApp(object):
             initialdir=self._guess_fw_dir())
         if not path:
             return
-        self.fw_path.set(path)
+        self._adopt_fw(path, announce=False)
+
+    def _adopt_fw(self, path, announce=False):
+        """装填一个 bin 文件：更新显示、记基准时间戳、存路径、重置状态。
+
+        2026-11-24 新增。抽成函数是因为 pick_file 和 check_fw_update 都要走
+        同一套装填逻辑 —— 两处各写一份的话，检查更新后大小显示忘了刷新
+        这类不一致迟早出现。
+        """
         try:
-            self.fw_size = os.path.getsize(path)
+            st = os.stat(path)
         except OSError as e:
             messagebox.showerror("读取失败", str(e))
-            return
-
+            return False
+        self.fw_path.set(path)
+        self.fw_size = st.st_size
+        # mtime 作为"有没有重新编译"的基准。只比 size 会漏掉"大小没变但
+        # 内容变了"（改个常量再编译），所以两个一起记。
+        self.fw_mtime = st.st_mtime
         self.fw_name.set("{}\n{:,} B  ({})".format(
             os.path.basename(path), self.fw_size, human_bytes(self.fw_size)))
-        self.var_target.set("{:,} B".format(self.fw_size))
+        self.btn_chk_fw.configure(state="normal")
+        # 路径选完立刻落盘，不再等关窗 —— 程序崩了/强杀进程也不丢上次路径
+        self.cfg["last_file"] = path
+        save_config(self.cfg)
+        # 只重置解析状态；原先同步 OTA 卡片标签/进度条的调用随卡片一起移除。
         self.ota_saved = 0
-        self.var_saved.set("0 B")
-        self.pb.configure(value=0)
-        self.var_verify.set("")
         self.var_tx.set("")
+        if announce:
+            self._sys_line("--- 已装填最新固件：{}（{:,} B）---".format(
+                os.path.basename(path), self.fw_size))
+        return True
+
+    def check_fw_update(self):
+        """检查当前选中的 bin 有没有被重新编译，变了就自动重新装填。
+
+        2026-11-24 新增。判定依据 = mtime 或 size 变化：
+          · mtime 变 —— 重新编译过（哪怕大小没变）
+          · size 变  —— 文件被替换或截断
+        不读文件内容算 CRC：几十 KB 的 bin 读一遍虽然不慢，但发送时本来
+        就会读，检查按钮没必要重复做这件事。
+        """
+        path = self.fw_path.get()
+        if not path:
+            return
+        if not os.path.isfile(path):
+            self._sys_line("--- 检查更新：固件文件已不存在：{} ---".format(path))
+            self.btn_chk_fw.configure(state="disabled")
+            return
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            self._sys_line("--- 检查更新失败：{} ---".format(e))
+            return
+        if abs(st.st_mtime - self.fw_mtime) < 1e-6 and st.st_size == self.fw_size:
+            self._sys_line("--- 检查更新：固件未变化（{:,} B）---".format(st.st_size))
+            return
+        old_size = self.fw_size
+        if self._adopt_fw(path, announce=True):
+            self._sys_line("--- 检测到固件已更新：{:,} B → {:,} B ---".format(
+                old_size, self.fw_size))
 
     def _guess_fw_dir(self):
-        """自动去 build/Debug 找，省得每次翻目录"""
+        """打开目录优先用上次选过的固件所在目录；文件被删则退到其父目录"""
         last = self.cfg.get("last_file")
-        if last and os.path.isfile(last):
-            return os.path.dirname(last)
+        if last:
+            if os.path.isfile(last):
+                return os.path.dirname(last)
+            d = os.path.dirname(last)
+            if os.path.isdir(d):
+                return d
         here = app_dir()
         cand = os.path.abspath(os.path.join(here, "..", "..",
                                             "Application", "build", "Debug"))
@@ -1428,133 +1799,24 @@ class OtaSerialApp(object):
         self.ota_verify = None       # 清掉上一轮的校验结论，否则会误判这次成功
         self.ota_declared = 0
         self.ota_crc = ""
-        self.var_saved.set("0 B")
-        self.pb.configure(value=0)
-        self.var_verify.set("")
 
         self.btn_go.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self._set_state("发送中…", C_WARN)
 
         chunk = int(self.chunk_var.get())
         delay = float(self.delay_var.get())
 
-        self._sys_line("--- 开始发送 {} （{} B，块 {}，延时 {}ms）{} ---".format(
-            os.path.basename(path), self.fw_size, chunk, delay,
-            " · 新架构 FWUP" if self.fwup_mode.get() else ""))
-
-        # 版本号只在主线程读一次再传进线程：Tk 变量不属于线程安全对象，
-        # 发送线程里现读现用，偶尔会拿到空串或半截值
-        if self.fwup_mode.get():
-            self.tx_thread = threading.Thread(
-                target=self._tx_worker_fwup,
-                args=(path, chunk, delay, self._read_fw_ver()),
-                daemon=True)
-        else:
-            self.tx_thread = threading.Thread(
-                target=self._tx_worker, args=(path, chunk, delay), daemon=True)
+        # 2026-11-24：发送固定走 BootLoader 老协议，不再按开关分叉。
+        self._sys_line("--- 开始发送 {} （{} B，块 {}，延时 {}ms）---".format(
+            os.path.basename(path), self.fw_size, chunk, delay))
+        self.tx_thread = threading.Thread(
+            target=self._tx_worker, args=(path, chunk, delay), daemon=True)
         self.tx_thread.start()
-
-    def _read_fw_ver(self):
-        """取版本号输入框的值。非法就回落 1 并明说，不静默改用户的输入。"""
-        raw = str(self.fw_ver_var.get()).strip()
-        try:
-            v = int(raw)
-        except Exception:
-            v = 0
-        if not (1 <= v <= 65535):
-            self._sys_line("--- 版本号「{}」不合法，本次按 1 发送 ---".format(raw))
-            return 1
-        return v
 
     def abort_file_send(self):
         if self.tx_thread and self.tx_thread.is_alive():
             self.abort_evt.set()
             self._sys_line("--- 用户中止发送 ---")
-
-    def _tx_worker_fwup(self, path, chunk, delay_ms, fw_ver):
-        """新架构：把「32 字节槽头 + 固件」直接发给正在运行的 App。
-
-        和老 _tx_worker 的四处本质区别：
-          1. 不做 SWD 复位 —— 目标是 App。复位会把 App 踢回 BootLoader，
-             接收状态机还没建立就被打断了
-          2. 头部先发 —— App 靠 'FWUP' 认出"这是固件"，业务数据不会误触发
-          3. 不发 OTAE 尾部 —— 长度和 CRC 已经在头部里。再发 12 字节只会被
-             App 当成固件数据，反而让 CRC 永远对不上
-          4. 发完不复位 —— App 写完头会自己 NVIC_SystemReset()。
-             外部复位若抢在前面，可能打断"写头"这一步，留下半成品
-        """
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except Exception as e:
-            self.rx_queue.put(("error", "读取文件失败: {}".format(e)))
-            return
-
-        total = len(data)
-        if total <= 0:
-            self.rx_queue.put(("error", "固件是空文件"))
-            return
-
-        crc = zlib.crc32(data) & 0xFFFFFFFF
-        # 版本号由界面传入（_read_fw_ver 已做范围兜底）。它一路原样走到
-        # 槽头 fw_ver → Boot 搬运时写进参数页 version，降级拦截就靠它比较
-
-        # 头部字节定义统一走 build_fwup_header，别在这里另写一份 pack
-        hdr = build_fwup_header(fw_ver, total, crc)
-
-        try:
-            self.ser.write(hdr)
-        except Exception as e:
-            self.rx_queue.put(("error", "发送头部失败: {}".format(e)))
-            return
-
-        self.rx_queue.put(("sys",
-            "--- FWUP 头已发：ver={} len={:,} crc=0x{:08X} ---".format(
-                fw_ver, total, crc)))
-
-        # 等 App 把「头部扇区」擦掉再开始发数据。
-        # 为什么必须等：App 收到 32 字节头后要先擦掉旧头所在的 4KB 扇区
-        # （W25Q 典型 45ms），这期间它不能取串口数据。115200 下 45ms 会进来
-        # 约 520 字节，而 App 的 DMA 环形缓冲只有 1024 字节 —— 头部一擦完
-        # 紧接着还要擦第一个数据扇区，两段阻塞叠起来正好逼近溢出边界。
-        # 这里先静一下，让缓冲从空开始，后面的"边收边擦"就宽松了。
-        time.sleep(0.3)
-
-        sent = 0
-        t0 = time.time()
-        last_ui = 0.0
-
-        try:
-            while sent < total:
-                if self.abort_evt.is_set():
-                    # App 那边会静默 3 秒后自行放弃，不需要再补什么命令
-                    self.rx_queue.put(("sys",
-                        "--- 已中止，App 会在 3 秒静默后放弃本次接收 ---"))
-                    self.rx_queue.put(("tx", (sent, total, 0.0, True, True)))
-                    return
-
-                block = data[sent:sent + chunk]
-                self.ser.write(block)
-                sent += len(block)
-
-                now = time.time()
-                if now - last_ui > 0.08 or sent >= total:
-                    self.rx_queue.put(("tx", (sent, total,
-                                              sent / max(now - t0, 1e-6), False)))
-                    last_ui = now
-
-                if delay_ms > 0:
-                    time.sleep(delay_ms / 1000.0)
-        except Exception as e:
-            self.rx_queue.put(("error", "发送中断: {}".format(e)))
-            self.rx_queue.put(("tx", (sent, total, 0.0, True, True)))
-            return
-
-        self.rx_queue.put(("tx", (sent, total,
-                                  sent / max(time.time() - t0, 1e-6), True)))
-        self.rx_queue.put(("sys",
-            "--- 发送完毕 {:,} B，等 App 校验并自复位（盯日志里的 [app-ota]）---".format(sent)))
 
     def _tx_worker(self, path, chunk, delay_ms):
         """后台线程：读文件 → 分块写串口。所有 UI 更新一律走队列。"""
@@ -1706,18 +1968,10 @@ class OtaSerialApp(object):
         self.btn_stop.configure(state="disabled")
 
         if aborted:
-            self._set_state("已中止", C_WARN)
             self._sys_line("--- 发送已中止（{} B）---".format(sent))
         elif sent >= total:
-            # 两种架构等的东西不一样：老流程等 BootLoader 回报 sum/verify，
-            # 新流程等 App 打完 [app-ota] 并自己复位回 BootLoader
-            self._set_state("发送完毕，等待 App 校验自复位…"
-                            if self.fwup_mode.get()
-                            else "发送完毕，等待 BootLoader 回报…", C_ACCENT)
             self._sys_line("--- 发送完毕 {} B，用时 {:.2f}s ---".format(
                 sent, total / max(speed, 1e-6) if speed else 0))
-        else:
-            self._set_state("发送异常结束", C_BAD)
 
     # ==========================================================================
     # 收尾
@@ -1735,9 +1989,9 @@ class OtaSerialApp(object):
             "chunk": self.chunk_var.get(),
             "delay": self.delay_var.get(),
             "auto_reset": self.auto_reset.get(),
-            "fwup_mode": self.fwup_mode.get(),
-            "fw_ver": self.fw_ver_var.get(),
             "last_file": self.fw_path.get(),
+            # 2026-11-24：颜色规则表随配置持久化，拷走 json 就等于换工程带走规则
+            "log_rules": [dict(r) for r in self.log_rules],
             "geometry": self.root.geometry(),
         })
         try:

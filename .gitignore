@@ -33,3 +33,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+# 上位机 ZET6 独立工程（不属于本 Boot_Loader 仓库）
+host_computer_ZET6/

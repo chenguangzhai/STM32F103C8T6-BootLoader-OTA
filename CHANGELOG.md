@@ -475,3 +475,726 @@ APP 只负责下载固件到片外 W25Q64，片内 Flash 应由 Boot（Recieve�
   否则尾页和标志都没落盘，Boot 读空标志直接跳旧固件，看起来像"没跑飞/没升级"。
 - 小观察：回滚恢复的是 17296B（上一版 mode1 测试固件，备份时 0x200000 里那份），
   虽与本次 17268B 不同版，但正是"恢复到备份的上一版"的正确行为。
+
+## 2026-11-24 09:55 — 阶段 1a：CAN 驱动 + 回环自测（OTA 改走 CAN 的第一步）
+
+### 问题（如有）
+
+`OTA_CAN_升级方案.md` 定下「串口信令 + 按键确认 + CAN 传输」后，阶段 1 是硬前置：
+现有 `can.c` 为 CubeMX 默认值、从未验证，且 `main.c` 只调了 `MX_CAN_Init()`——
+无过滤器、无 `HAL_CAN_Start`、无接收中断，外设从未进入收发状态。
+`stm32f1xx_it.c` 里也没有任何 CAN 中断处理函数。
+
+已拍板参数：波特率 500kbps、单机 node_id=1、暂无 USB-CAN 分析仪（先用回环自测）。
+
+### 改动
+
+- `APP/Application/BSP/CAN/can_drv.h` — 新建。对外只暴露帧结构与函数，不 include 任何 HAL 头，
+  上层（ISO-TP / 会话状态机）不必认识 `CAN_HandleTypeDef`。内含报文 ID 定义
+  （`0x600/0x580 + node_id`）、`CANDRV_PRESCALER=4`、回环自测开关
+  `CANDRV_SELFTEST_LOOPBACK`（默认 1，有分析仪后改 0）。
+- `APP/Application/BSP/CAN/can_drv.c::CanDrv_Init` — 新建。在 `HAL_CAN_Init` 之前**全量覆盖**
+  时序与行为参数（500kbps / 88.9% 采样点 / ABOM+ARD+RFL 三开关 ENABLE）。
+  这样做的原因：`can.c` 的这些字段在 CubeMX 非 USER 区，重新生成代码会退回
+  750kbps 的历史默认值；把权威值放代码里，改 `.ioc` 或点一次 Generate Code 都不会让运行时悄悄变坏。
+  副作用：`can.c` 中的数值只供阅读，真正生效的是本函数；两处需同步改。
+  另外配置 32 位掩码过滤器精确匹配 `0x601`、使能 RX0/SCE 中断、`HAL_CAN_Start`、
+  激活 `RX_FIFO0_MSG_PENDING|ERROR|BUSOFF|ERROR_PASSIVE`。
+- `APP/Application/BSP/CAN/can_drv.c::CanDrv_Send` — 新建。等空邮箱（不阻塞死等）、
+  发完再等邮箱变空才返回 OK ——「递进邮箱」在 BusOff 时会假成功，只有邮箱空了才说明帧真的走完总线。
+  另：发送前把数据补零拷进本地 8 字节缓冲，因为 F1 HAL 的 `HAL_CAN_AddTxMessage`
+  会无视 DLC 直接读 `aData[0..7]`，短缓冲（如 2 字节）会读越界。
+- `APP/Application/BSP/CAN/can_drv.c::HAL_CAN_RxFifo0MsgPendingCallback / HAL_CAN_ErrorCallback`
+  — 新建（覆盖 HAL 的 `__weak` 空实现）。收帧入 8 深度环形队列，满时丢新帧并计数
+  （ISO-TP 连续帧序号会暴露缺口，比静默覆盖旧帧安全）；错误回调统计 BusOff 与
+  FIFO 溢出（`HAL_CAN_ERROR_RX_FOV0`，用于将来验证块级半双工是否真留出了空窗期）。
+  因为 ABOM 已开、硬件会自恢复，这里不抢着 `HAL_CAN_Start` 重入。
+- `APP/Application/BSP/CAN/can_drv.c::USB_LP_CAN1_RX0_IRQHandler / CAN1_SCE_IRQHandler` — 新建。
+  放在本文件而非 `stm32f1xx_it.c`（后者是生成文件，重新生成会覆盖）。
+  **踩坑**：F103 中密度的 CAN RX0 向量名是 `USB_LP_CAN1_RX0_IRQHandler`（与 USB 低优先级
+  共用，IRQn 20），不是 `CAN1_RX0_IRQHandler`。写错名字链接不报错，中断掉进
+  `Default_Handler` 的 `while(1)`，表现为「初始化成功但永远收不到帧」。
+- `APP/Core/Src/can.c::MX_CAN_Init` — 改（先完整读过）。原值 `Prescaler=16/BS1=1TQ/BS2=1TQ`
+  = 750kbps、采样点 66.7%，改为 `4/15TQ/2TQ` = 500kbps、88.9%；
+  `AutoBusOff/AutoRetransmission/ReceiveFifoLocked` 由 DISABLE 改 ENABLE。
+  仅让文件内容与实际配置一致，运行时权威值在 `can_drv.c`。
+- `APP/Core/Src/main.c::main` — 改（先完整读过）。`USER CODE BEGIN Includes` 加 `can_drv.h`；
+  `USER CODE BEGIN 2` 在 `Uart_Init()` 与 `Boot_Loader_Init()` 之后调
+  `CanDrv_Init(CANDRV_DEFAULT_MODE)` + `CanDrv_SelfTest()`，串口打印
+  `[can] init OK (loopback)` / `[can] loopback self-test PASS (tx=.. ovf=.. err=.. bof=..)`。
+  放在确认逻辑之前、`OTA_TEST_CRASH` 测试桩之前，不改变原有回滚测试路径。
+- `OTA_CAN_升级方案.md` — 补 §6.4「收发器使能」：`CAN_STB`(PB7) 上电被 `gpio.c` 置高
+  （推挽输出，初值 SET），若为待机脚则正常总线模式下收发器一直关着、帧出不去；
+  回环不受影响，切正常模式前必须拉低。§11 待确认项标注已拍板结论，新增 §12 实施进展表。
+- 验证：用 `~/.eide/tools/gcc_arm` 相同编译选项编译全部 35 个源文件 + 新增 can_drv.c，
+  `-Wall` 零错误零警告；链接通过（RAM 8632B/20KB = 42.15%，FLASH 20320B/44KB = 45.10%，
+  其中 can_drv 占 1116B text + 149B bss）；`objdump .isr_vector` 核对 IRQn 20/22
+  两个向量已指向 `0x080090a0` / `0x080090b0`（即两个中断处理函数），不再落 `Default_Handler`。
+- **待上板验证**：串口应打印 `[can] init OK (loopback)` 与 `[can] loopback self-test PASS`。
+  PASS 即说明时序配置合法、过滤器放行、中断已接、回调被调、队列搬运正确。
+
+## 2026-11-24 10:01 — 阶段 1a 改造：CAN 参数权威归还 CubeMX，驱动改为读回校验
+
+### 问题（如有）
+
+上一版（09:55）把位时序与 ABOM/ARD/RFL 在 `can_drv.c::CanDrv_Init()` 里全量覆盖，
+理由是防止 CubeMX 重新生成代码把参数改回 750k。但这样同一组参数存在两处真相
+（`.ioc` 一处、驱动宏一处），比它要解决的问题更难维护。用户明确「CAN 配置直接用 CubeMX 生成」，
+改为单一真相来源：**CubeMX / .ioc 负责参数，驱动只负责校验与 CubeMX 做不到的部分**。
+
+### 改动
+
+- `APP/Application/BSP/CAN/can_drv.h` — 改（先完整读过）。
+  删除 `CANDRV_PRESCALER`、`CANDRV_SELFTEST_LOOPBACK`、`CANDRV_DEFAULT_MODE`、`can_drv_mode_t`；
+  改为 `CANDRV_EXPECT_BAUD=500000` / `CANDRV_EXPECT_SAMPLE_PM=889`（**只用于校验，不参与初始化**）、
+  `CANDRV_MODE_NORMAL/LOOPBACK`（值与 HAL 一致，驱动只读不写）；
+  新增返回值 `CANDRV_ERR_TIMING(-6)`、`CANDRV_ERR_NO_IRQ(-7)`；
+  新增 `CanDrv_ActualBaudrate / ActualSamplePointPermille / GetMode`；
+  `CanDrv_Init()` 改为无参（模式由 .ioc 决定）。
+- `APP/Application/BSP/CAN/can_drv.c::CanDrv_Init` — 改（先完整读过）。删除全部参数覆盖与
+  `HAL_CAN_Start` 前的重新 `HAL_CAN_Init`；改为三条校验：
+  ① `HAL_CAN_GetState == READY`，否则 `-2`；
+  ② `Measure_Timing()` 从 `hcan.Init`（即 HAL 真正写进 BTR 的值）反算波特率与采样点
+     （TS1/TS2 字段存的是 TQ-1，反算时 +1），偏离 500kbps ±1% / 88.9% ±3% 返回 `-6`；
+  ③ `NVIC_GetEnableIRQ(CAN1_RX0_IRQn) == 0` 返回 `-7`（CubeMX NVIC 里没勾时，FIFO 会满但回调
+     永远不会被调用，症状「发得出去、收不回来」与总线故障极像，值得单列错误码）。
+  之后才配过滤器、`HAL_CAN_Start`、`ActivateNotification`，并记下 `hcan.Init.Mode` 供上层查询。
+- `APP/Application/BSP/CAN/can_drv.c` — 删（先完整读过）。移除 `USB_LP_CAN1_RX0_IRQHandler` 与
+  `CAN1_SCE_IRQHandler` 两个定义、以及 `HAL_NVIC_SetPriority/EnableIRQ`：
+  中断函数改由 CubeMX 生成到 `stm32f1xx_it.c`，NVIC 由 CubeMX 配置，避免同名强定义冲突。
+- `APP/Application/BSP/CAN/can_drv.c::CanDrv_SelfTest` — 加一道前置判断：非 Loopback 模式直接返回
+  `CANDRV_ERR_STATE`。正常模式下没有对端，硬测只会得到误导性的 FAIL。
+- `APP/Core/Src/main.c::main` — 改（先完整读过）。`CanDrv_Init()` 无参调用；
+  成功时打印实际波特率与采样点（`[can] init OK, 500000 bps, sample 88.8%, loopback`）；
+  Loopback 才跑自测，Normal 打印 `self-test skipped (needs a peer)`；
+  失败打印 `[can] init FAIL code=%d` 并注释了 -2/-6/-7 的含义。
+- `APP/Core/Src/can.c::MX_CAN_Init` — 只改注释：说明权威来源是 `.ioc`，重新生成会覆盖本段注释属正常，
+  运行时由 `CanDrv_Init()` 读回校验兜底（数值本身保持 500k/88.9% 不变）。
+- `OTA_CAN_升级方案.md` — §6.3 改写为「初始化顺序与职责划分」（CubeMX 管什么、驱动补什么、
+  读回校验怎么兜底，并记录 `USB_LP_CAN1_RX0_IRQHandler` 陷阱）；新增 §6.5「CubeMX 配置清单」
+  （Mode/Prescaler/BS1/BS2/SJW/三个 Advanced 开关/NVIC 两个中断/PB7 初值），并说明生成后要核对 `can.c`。
+- 验证：同前次方法编译全部 35 个源文件 + can_drv.c，`-Wall` 零错误零警告；链接通过
+  RAM 8632B/20KB = 42.15%，FLASH **19376B**/44KB = 43.00%（比 09:55 版少 944B，删掉了参数覆盖与中断函数）。
+- **当前状态**：`.ioc` 尚未重新生成，`it.c` 里还没有 CAN 中断函数、NVIC 也没使能，
+  所以此刻烧录会在串口看到 `[can] init FAIL code=-7` —— 这是**预期行为**，
+  按 §6.5 清单在 CubeMX 里配好并生成后即可 `PASS`。
+
+## 2026-11-24 12:55 — 修复 Recieve(Boot) 工程 CubeMX 生成把 main.c 写坏 + 核查 CAN 配置
+
+### 问题（如有）
+
+用户在 CubeMX 里给 **Recieve（Boot，0x08000000/20K）** 配了 CAN，生成后 `Recieve/Core/Src/main.c`
+被写坏：文件里出现**两个 `int main(void)`**，第一个在 `/* USER CODE BEGIN 2 */` 之后
+直接接上 `/* USER CODE END Includes */` 和整段 Private/PFP 段，再接第二个 `int main(void)`
+（C 语言不允许嵌套函数定义，且重复定义 main）→ 工程无法编译。
+
+**根因**：`USER CODE` 标记配对错乱。待生成的 main.c 里 `USER CODE BEGIN 2` 内部残留了一段
+`/* USER CODE END Includes */`（更早的手工粘贴遗留），CubeMX 按标记切分插入点时就错位，
+把「Includes 之后到文件末尾」整段又复制了一遍。HEAD 版本只有一处 Includes 块（第 28~34 行），
+说明这个残留不在已提交版本里。
+
+### 改动
+
+- `Recieve/Core/Src/main.c` — **恢复为 HEAD 版本**（`git checkout --`，212 行，单个 main()）。
+  依据：`git diff --stat` 显示该文件只有新增 70 行、无删除，新增的 70 行全是重复段与旧注释，
+  不包含任何业务逻辑；HEAD 版本已包含 `MX_CAN_Init()` 调用与全部 USER CODE 2 业务代码。
+  恢复后 `USER CODE END Includes` 只剩第 34 行一处，根因一并消除。
+- 验证：用 `Recieve/build/Debug/compile_commands.json` 的选项编译全部 37 个源文件，
+  零错误零警告；链接通过 —— **RAM 5176B/20KB = 25.27%，FLASH 19684B/20KB = 96.11%（仅剩 796B）**。
+
+### 核查结论（用户问「改没改对」）
+
+- ✅ `CAN.Mode = CAN_MODE_LOOPBACK`：`can.c` 已生效。
+- ✅ 三个开关：`CAN.ABOM / CAN.NART / CAN.RFLM = ENABLE` → 生成出
+  `AutoBusOff / AutoRetransmission / ReceiveFifoLocked` 全 **ENABLE**（`.ioc` 键名是反向语义，
+  但**以生成物为准**，实测正确）。
+- ✅ NVIC：`can.c::HAL_CAN_MspInit` 里已生成 `USB_LP_CAN1_RX0_IRQn` / `CAN1_SCE_IRQn`
+  的 `SetPriority(0,0)` + `EnableIRQ`；`stm32f1xx_it.c` 生成了两个中断处理函数
+  （名字正是 `USB_LP_CAN1_RX0_IRQHandler` / `CAN1_SCE_IRQHandler`）；`stm32f1xx_it.h` 加了声明。
+- ❌ **位时序没改**：`can.c` 仍是 `Prescaler=16 / TimeSeg1=CAN_BS1_1TQ / TimeSeg2=CAN_BS2_1TQ`
+  = 750kbps、采样点 66.7%。`Recieve.ioc` 里也只有 `CAN.CalculateBaudRate=749999`
+  / `CalculateTimeBit=1333` / `CalculateTimeQuantum=444.44`，**没有** `CAN.Prescaler/BS1/BS2/SJW` 键，
+  说明 Bit Timings 那一组字段在界面上没被动过。
+- ⚠ 注意事项：本次配置的是 Boot 工程，而阶段 1a 的 `can_drv.c` + 回环自测在 **APP 工程**
+  （0x08005000/44K）；Boot 里只有 `MX_CAN_Init()`，没有 `HAL_CAN_Start` / `ConfigFilter`，
+  CAN 外设配好了也不会收发。若这是为阶段 4 提前铺路，需注意 Flash 只剩 796B，
+  而 `can_drv.c` 实测占 1116B text —— **照现状直接搬进 Boot 一定溢出**。
+
+## 2026-11-24 12:54 — 定位 CubeMX 重复生成 main.c 的根因（注释里写了标记原文）
+
+### 问题（如有）
+
+12:55 修复 Recieve/main.c 后，用户在 CubeMX 里改完位时序再生成，该文件**又被写坏成完全相同的
+282 行结构**（两个 `int main(void)`），`diff` 显示两级产物**逐字节一致**——说明不是随机故障，
+而是确定性的解析错位。
+
+**根因**：`Recieve/Core/Src/main.c` 第 31 行（HEAD 里就有）是一句普通注释：
+
+```c
+/* w25q_test.h 已移除：自检代码为回滚逻辑腾 Flash 让路，见下方 USER CODE BEGIN 2 */
+```
+
+这句注释**字面写出了「2 号用户代码段开始标记」的原文**。CubeMX 是按字符串查找标记来定位用户
+代码段的，扫描时先在第 31 行（Includes 块内）命中，就认为用户代码段从那句注释开始，一直截到
+真正的结束标记为止，再整段插回模板 —— 于是 Includes 尾部、Private/PTD/PD/PM/PV/PFP 各段、
+直到第二个 `main()` 全部被重复一遍。
+
+这也解释了为什么「恢复 HEAD 再生成」会复发：HEAD 本身就带着这句自指注释，脏数据不在缓存里，
+在源文件里。
+
+> 通用教训：**源码注释里永远不要写出 CubeMX 标记原文（段名 + BEGIN/END 的组合）**，
+> 哪怕只是在描述它。同理，文档/日志里提标记也应断开写法。
+
+### 改动
+
+- `Recieve/Core/Src/main.c` — 先 `git checkout --` 恢复 HEAD，再把第 31 行注释改写成不包含
+  标记原文的措辞（改为「2 号用户代码段的开始标记」描述），并留下踩坑说明。
+  验证：`grep -c "^int main(void)"` = 1；全仓扫描「非标记行却含 USER CODE 字样」只剩 0 处；
+  单文件编译 `-Wall` 零错误零警告。
+- `APP/APP.ioc` — 补齐 CAN 配置（键名与取值**照抄 Recieve.ioc**，即同一版 CubeMX 自己生成的写法，
+  不是猜的；行尾保持 CRLF）：
+  `CAN.Prescaler=4` / `CAN.BS1=CAN_BS1_15TQ` / `CAN.BS2=CAN_BS2_2TQ` /
+  `CAN.Mode=CAN_MODE_LOOPBACK` / `CAN.ABOM=ENABLE` / `CAN.NART=ENABLE` / `CAN.RFLM=ENABLE` /
+  `CAN.CalculateBaudRate=500000` / `CAN.CalculateTimeBit=2000` /
+  `CAN.CalculateTimeQuantum=111.11111111111111`，并同步更新 `CAN.IPParameters`；
+  NVIC 增加 `CAN1_SCE_IRQn` 与 `USB_LP_CAN1_RX0_IRQn` 两条（值同 Recieve.ioc）。
+  副作用：APP 工程尚未重新生成，`can.c::MspInit` 里还没有那两行 `HAL_NVIC_EnableIRQ`、
+  `it.c` 里还没有 CAN 中断函数 —— 此时烧录 `CanDrv_Init()` 会返回 `-7`（中断未使能），
+  需在 CubeMX 打开 APP.ioc 点一次 Generate 才会补齐。
+- 说明：此次只改了 `.ioc` 与注释，未手改 APP 的生成文件；保持「生成物由 CubeMX 产出」的原则。
+
+## 2026-11-24 17:28 — 从 Boot(Recieve) 工程彻底移除 CAN，取消阶段 4
+
+### 问题（如有）
+
+用户提出：CAN 接收代码在 APP 里，Boot 不需要 CAN。核对后确认成立：
+`OtaW25q_Feed(buf, len)` 只认「连续字节流」，不关心字节来自 CAN 还是串口，传输通道与搬运逻辑本就解耦。
+方案 §9 原先要求「Boot 增加最小 CAN 入口」只是针对「App 坏了」场景的冗余保险，而该场景已有
+实机验证过的 UART 救砖通道（`Boot_Loader_BootWindow()` 的 3 秒窗口）。
+
+继续保留的代价很具体：Boot 只剩 796B Flash，一个裁剪版 CAN 接收粗估需 600~900B；
+且要维护两套行为不一致的协议栈。故决定**取消阶段 4**，Boot 回到纯 UART 通道。
+
+### 改动
+
+- `Recieve/Core/Src/can.c`、`Recieve/Core/Inc/can.h` — **删除**。Boot 不再有 CAN 初始化与句柄。
+- `Recieve/Core/Src/main.c::main` — 删 `#include "can.h"` 与 `MX_CAN_Init();`，
+  在原位置留注释说明「这里是刻意没有的，不是漏了」。
+  注：本文件第 31 行上一轮已改掉含 CubeMX 标记原文的注释（重复生成的根因），本次未动。
+- `Recieve/Core/Src/stm32f1xx_it.c` — 删 `USB_LP_CAN1_RX0_IRQHandler`、`CAN1_SCE_IRQHandler`
+  两个函数（含上方 doc 注释）与 `extern CAN_HandleTypeDef hcan;`。
+- `Recieve/Core/Inc/stm32f1xx_it.h` — 删对应两条声明（删完与 HEAD 一致）。
+- `Recieve/Recieve.ioc` — 删全部 `CAN.*` 键、`Mcu.IP0=CAN`（并重编号 `Mcu.IP1..6 → IP0..5`、
+  `Mcu.IPNb=7 → 6`）、`PB8.*` / `PB9.*` 的 CAN 复用（PB8/PB9 恢复为未分配引脚）。
+- `Recieve/cmake/stm32cubemx/CMakeLists.txt` — 源清单移除 `Core/Src/can.c`（文件已删，
+  否则 CMake 构建会找不到文件）。`stm32f1xx_hal_can.c` 与 `HAL_CAN_MODULE_ENABLED` **保留**：
+  HAL 驱动留着无害（未被引用，`--gc-sections` 会整个丢弃），将来若恢复 CAN 不必再动 conf。
+- `OTA_CAN_升级方案.md` — 状态行标注阶段 4 取消；§9 两行风险表改写为定稿结论（含「现场串口可达」
+  这一前置条件）；§10 分期表划掉阶段 4、说明总工期 4 期减为 3 期；§12 增加本次移除记录。
+- 验证：编译 36 个源文件（`can.c` 已跳过）`-Wall` 零错误零警告；链接通过
+  **RAM 5136B/20KB = 25.08%，FLASH 18460B/20KB = 90.14%**。
+  相比移除前（19684B/96.11%）**净省 1224B Flash、40B RAM**，余量从 796B 提到 2020B。
+  `nm` 检查镜像内已无 CAN 实现代码；`objdump .isr_vector` 确认 IRQn 20/22 均落回
+  `Default_Handler`（`0x080038a0`），即那两个向量只剩启动文件的弱别名，不会执行任何 CAN 逻辑。
+- 副作用与注意事项：
+  1. `CAN_STB`(PB7) 仍保留为推挽输出（`gpio.c`，初值高=收发器待机）。它是**板级接线**、
+     不是 CAN 外设配置，Boot 不管 CAN 时把它保持在待机反而更合适，故未删。
+  2. 将来若真要恢复 Boot 侧 CAN：在 CubeMX 里重新勾选 CAN 即可（`.ioc` 已无残留键，
+     不会与新配置冲突），但需先解决 §9 记录的 2020B 余量问题。
+
+## 2026-11-24 17:57 — 串口助手移除 OTA 状态面板、修复日志无法复制，重新打包 exe
+
+### 问题（如有）
+
+用户要求把 `Tools/SerialAssist` 界面上的「OTA 状态」卡片整块去掉；并反馈红色失败日志
+（如 `[can] init FAIL code=-7`）选不中、复制不了，想直接贴给智能体分析。
+
+根因确认：红色只是 `_classify()` 打上的 `bad` 文本 tag，不是复制障碍；真正原因是
+接收区 `tk.Text` 一直处于 `state="disabled"`，Tk 在禁用态下不接受选中操作，
+所以包括红字在内的所有日志都选不中，Ctrl+C 自然无效。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::_build_middle` — 不再构造右侧 OTA 状态卡片，
+  右栏只保留「固件发送」；接收区由 `state="disabled"` 改为 `normal`，绑定 `<Key>`
+  白名单与右键菜单（复制选中 / 复制全部日志 / 全选）。副作用：接收区无法再被
+  用户改写（编辑键由 `_on_rx_key()` 吞掉），但选中、复制、Ctrl+L 清屏均正常。
+- `Tools/SerialAssist/serial_assist.py::_build_ota_card` — 整块删除（状态灯、App 基址、
+  页大小、已落盘、目标大小、进度条、校验结论标签）。这些结论仍可由日志原文看到，
+  发送决策所需数据由解析器继续维护。
+- `Tools/SerialAssist/serial_assist.py::__init__` — 删掉纯显示字段 `fw_verified`；
+  其余 OTA 字段加注释说明为何保留：`ota_saved / ota_proto / ota_verify / ota_done_ts`
+  决定尾部记录发不发、何时等落盘与复位。
+- `Tools/SerialAssist/serial_assist.py::_handle_line` — 摘掉全部面板更新调用，只保留
+  影响发送决策的四类解析（ready / page / tail / verify）；删除随之失效的
+  `_set_state / _flash_lamp / _update_progress / _update_verify` 与 6 个死正则常量。
+  副作用：boot / can 等日志不再驱动界面状态，仅按来源着色显示。
+- `Tools/SerialAssist/serial_assist.py::_insert / clear_rx / open_port / close_port /
+  pick_file / start_file_send / _on_tx_progress` — 同步移除 state 切换与面板标签写入，
+  颜色高亮保持不变，复制不再受控件禁用态影响。
+- `Tools/SerialAssist/README.md::界面与日志说明` — 示意图去掉 OTA 状态块；新增
+  「复制日志」一节；日志解析表改为描述内部作用；同步修正几处引用右侧面板的过时说明。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 用现有 PyInstaller 参数重新打包
+  （`--onefile --noconsole`，含 `list_ports_windows` 隐藏导入）。自检通过：
+  UI self-check OK、串口枚举 7 个、配置路径落在 exe 同目录。
+- 验证：源码与 exe 的 `--check` 均通过；自动化实测确认 OTA 卡片控件已不存在
+  （`hasattr(app, "pb") == False`）、接收区 `state == normal`、模拟的红色 FAIL 行
+  可被选中并复制进剪贴板（`[can] init FAIL code=-7`）。
+- 清理：PyInstaller 命令行模式在项目根目录生成的临时 `STM32_OTA_SerialAssist.spec`
+  已删除，原有 `Tools/SerialAssist/STM32_OTA_SerialAssist.spec` 保持不变。
+
+## 2026-11-24 18:14 — 修复红字日志选中时看不出高亮
+
+### 问题（如有）
+
+用户实测截图显示：拖选接收区时其它行变蓝底，唯独 `[can] init FAIL code=-7`
+那行仍是浅红底，反馈为「红色的字体没办法选择」。
+
+根因：`bad` 标签设了 `background="#FDECEA"`，而 Tk 的 tag 优先级按创建顺序
+递增、内置 `sel` 排在用户标签之前，所以红底盖住了选区高亮。程序层面选区
+其实已包含该行（剪贴板实测能拿到），缺的是视觉反馈。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::_build_middle` — 着色配置末尾给 `sel`
+  显式设 `background="#0078D8"` 并 `tag_raise("sel")`，让选中高亮压过所有
+  来源色标签；不设 `sel` 的 `foreground`，选中后仍按来源着色，便于分辨日志类型。
+- `Tools/SerialAssist/README.md::复制日志` — 补充两个 Tk 坑的说明
+  （disabled 不能选中、tag 优先级遮挡选区高亮）。
+- 验证：Tk 小实验确认 `tag_raise("sel")` 前后 `tag_names` 顺序由
+  `('sel', 'bad')` 变为 `('bad', 'sel')`，红字行选中时蓝底生效；
+  在真实界面实例上复测 `tag_names` 为 `('bad', 'sel')`、剪贴板仍拿到红字原文。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 18:15 重新打包，自检通过
+  （UI OK、串口 7 个、配置路径在 exe 同目录）。因当时有两个旧实例正在运行、
+  文件被占用，原 exe 先改名为 `STM32_OTA_SerialAssist_old.exe` 作为备份；
+  关闭旧实例后可删除该备份文件（Windows 不允许删除运行中的 exe，故未自动清理）。
+
+## 2026-11-24 18:22 — 串口助手彻底移除「新架构」FWUP 路径
+
+### 问题（如有）
+
+用户要求去掉界面上的「新架构：直接发给 App（FWUP 头，免复位）」复选框。
+确认范围后（用户选"连发送逻辑一起删干净"，并同意同步删除命令行工具的
+app-ota 模式），把整条 FWUP 路径从两个工具中移除，发送固定走 BootLoader 老协议。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::模块级协议定义` — 删除 `OTA_HDR_MAGIC`、
+  `OTA_HDR_VER` 与 `build_fwup_header()`（32 字节槽头），保留 `build_ota_tail()`
+  与 OTAE 尾部；注释说明删除原因与连带影响。
+- `Tools/SerialAssist/serial_assist.py::_build_fw_card` — 删除 FWUP 复选框、
+  固件版本号输入框与「发送前复位」互斥联动 `_sync_send_mode()`；后续控件
+  row 重编号为 5~8，布局不变。
+- `Tools/SerialAssist/serial_assist.py::start_file_send` — 删除路径分叉，固定启动
+  `_tx_worker`；删除 `_read_fw_ver()` 与整个 `_tx_worker_fwup()`。
+- `Tools/SerialAssist/serial_assist.py::on_close` — 不再写 `fwup_mode` / `fw_ver`
+  两个配置键。
+- `Tools/SerialAssist/ota_headless.py` — 删除 `app-ota` 模式（choices、`--ver`
+  参数、发送分支、FWUP 头打包调用），只保留 boot-ota / flash-boot / watch；
+  import 只留 `build_ota_tail, find_openocd, openocd_reset`。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 18:22 重新打包，自检通过
+  （UI OK、7 个串口、配置路径在 exe 同目录）；上一轮遗留的 `_old.exe` 备份已删除。
+- 验证：两个 Python 文件 `py_compile` 通过；`ota_headless.py --help` 只列三种模式；
+  GUI `--check` 通过；全目录 Grep 无 FWUP / 版本号的活跃代码引用，只剩说明性注释。
+- 副作用：不再能通过 GUI 或命令行给运行中的 App 发 FWUP 槽头升级；若需恢复，
+  须从版本历史取回 `build_fwup_header()` 与 app-ota 分支。
+
+## 2026-11-24 18:31 — 串口助手新增「刷新软件」按钮，换调试器不用重启
+
+### 问题（如有）
+
+用户反馈：每换一次调试器就要重新打开软件，很麻烦。
+根因：`detect_debugger()` / `find_openocd()` 只在 `__init__` 调用一次，
+中途换 DAP-Link / ST-Link 后 `ocd_iface` 和 SWD 复位按钮仍是启动时的旧值。
+确认范围后用户选择"整个软件刷新"（软重启：断串口 + 清日志 + 重置状态 + 重认调试器）。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::__init__` — 把内联的调试器探测抽成
+  `_probe_debugger()`；`_build_topbar` 在「打开串口」右侧新增「刷新软件」按钮。
+- `Tools/SerialAssist/serial_assist.py::_probe_debugger` — 2026-11-24 新增。
+  重新探测 OpenOCD 与在位调试器；配置里手写的 `ocd_iface` 仍优先于探测结果
+  （保留"认错了"的逃生口，刷新不偷偷覆盖用户明确的选择）。
+- `Tools/SerialAssist/serial_assist.py::_apply_debugger_ui` — 2026-11-24 新增。
+  统一同步复位按钮可用性、提示文字与颜色；label 存为 `lb_ocd_hint` 引用，
+  从 `_build_fw_card` 抽出，刷新时不必重建控件。
+- `Tools/SerialAssist/serial_assist.py::refresh_software` — 2026-11-24 新增。
+  停发送/断串口 → 清屏与解码/解析/计数状态 → 重认调试器 → 重扫串口 → 打回执；
+  固件路径、窗口位置、配置勾选保留（等价于真重启后从 json 恢复）。
+  副作用（用户已确认）：已连串口会被断开、日志与 OTA 状态清零、发送中的固件被中止。
+- `Tools/SerialAssist/README.md::换调试器不用改配置 / 常见问题` — 新增「刷新软件」
+  小节说明用法与配置覆盖优先级；SWD 复位排障加第 0 步；界面示意图补按钮。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 18:31 重新打包，自检通过
+  （UI OK、串口 7 个、调试器 ST-Link V2-1 → interface/stlink.cfg、配置在 exe 同目录）。
+- 验证：源码 `py_compile` 与 `--check` 通过；自动化模拟"状态弄脏后点刷新"，
+  确认 `ota_saved / ota_verify / rx_count / tx_count` 归零、日志清空且写入两行回执、
+  调试器重新识别结果与按钮状态一致。
+
+## 2026-11-24 18:49 — 串口助手新增日志颜色设置窗口
+
+### 问题（如有）
+
+用户问清接收区六种日志颜色的分类逻辑后，要求能在界面上自己设置字体颜色。
+确认范围：只改接收区六种日志标签的字色，不碰整个软件主题，也不改 `bad` 的浅红底。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::常量` — 新增 `LOG_COLOR_DEFS`（六种标签的
+  名称/默认色/预览示例/命中规则）、`BAD_BG`、`HEX_COLOR_RE`；`import colorchooser`。
+- `Tools/SerialAssist/serial_assist.py::__init__` — 从 `cfg.log_colors` 读字色，
+  缺项或非法色值（不匹配 `#RRGGBB`）静默回退默认色。原因：Tk 收到非法颜色会在
+  `tag_configure` 抛 TclError 导致界面起不来，不能让手改 json 把软件弄崩。
+- `Tools/SerialAssist/serial_assist.py::_apply_log_colors` — 2026-11-24 新增，
+  统一应用六种 tag 的字色；改色后重新 `tag_raise("sel")`，防止红字行选中又看不出高亮。
+  启动时和设置确定后都走这里。
+- `Tools/SerialAssist/serial_assist.py::open_color_settings` — 2026-11-24 新增。
+  顶部栏「设置」按钮打开 Toplevel：六种色块按钮 + 系统调色盘 + 实时预览 +
+  恢复默认 + 取消/确定。用临时 `pending` 字典承接改动，取消不碰主界面；
+  确定后一次性应用、写 json、打日志。
+- `Tools/SerialAssist/serial_assist.py::on_close` — 保存配置时带上 `log_colors`。
+- `Tools/SerialAssist/README.md::设置日志颜色` — 新增一节，列出六种标签的
+  规则与默认色，说明字色可改而 `bad` 浅红底固定、非法色值会回退。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 18:49 重新打包，自检通过
+  （UI OK、串口 7 个、调试器 ST-Link V2-1 → interface/stlink.cfg、配置在 exe 同目录）。
+- 验证：改色应用到 `tag_configure` 后读取确认 `bad` 字色变化、背景仍是 `#FDECEA`；
+  配置写入再读回一致；打开设置窗口无异常；红字行 tag 顺序仍为 `('bad','sel')`，
+  选中高亮优先级未被改色破坏。测试写入的临时色值已从源码目录配置中清除。
+
+## 2026-11-24 18:57 — 日志颜色升级为可自定义规则表，换工程可带走
+
+### 问题（如有）
+
+用户要求能自己加"哪个字段显示什么颜色"、也能改现有字段的颜色，换工程还能用。
+上一版的六种固定标签（只能改字色）不够 —— 需要规则表驱动，且规则随配置走。
+确认范围：关键词"包含"匹配（| 分隔多个）；规则跟着 `assist_config.json` 走，
+不加单独的导入导出按钮。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::常量` — 用 `DEFAULT_LOG_RULES` （规则字典
+  tag/name/pattern/fg/bg/builtin）替代 `LOG_COLOR_DEFS`；新增 `default_log_rules()`
+  与 `load_log_rules()`：校验 tag 名（防 Tk 异常）、拦截非法色值与 `sel` 占用、
+  兼容上一版 `log_colors` 字典。**修正一个加载 bug**：配置保存的是完整规则表，
+  必须以配置为唯一来源重建，不能"默认 6 条 + 配置全部追加"（否则重开规则翻倍、
+  用户调好的优先级顺序失效）；内置身份以代码为准，不信 json 里的 builtin 字段。
+- `Tools/SerialAssist/serial_assist.py::__init__` — 改用 `self.log_rules = load_log_rules(cfg)`。
+- `Tools/SerialAssist/serial_assist.py::_classify` — 从 @staticmethod 改为实例方法，
+  按规则表顺序匹配（子串、| 分隔、首命中即停）；sys 规则 pattern 为空不参与匹配。
+- `Tools/SerialAssist/serial_assist.py::_apply_log_colors` — 遍历规则表应用颜色；
+  新增 `_clear_all_log_tags` / `_recolor_existing`，让确定设置后屏幕上已有行按新规则
+  重新着色（`--- ` / `>>> ` 开头的工具提示行保留挂 sys tag）。
+- `Tools/SerialAssist/serial_assist.py::open_color_settings` — 重写为规则编辑器：
+  Treeview 列表 + 新增/编辑/删除/上下移 + 实时预览 + 恢复默认 + 取消/确定；
+  内置规则不可删；用深拷贝 pending 承接改动，取消不碰主界面。
+- `Tools/SerialAssist/serial_assist.py::on_close` — 持久化 `log_rules` 完整列表。
+- `Tools/SerialAssist/README.md::自定义日志颜色规则` — 重写该节：规则语法、
+  首命中优先级、换工程拷 json、非法值回退与旧配置兼容。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 18:57 重新打包，自检通过
+  （UI OK、串口 7 个、调试器 ST-Link V2-1 → interface/stlink.cfg、配置在 exe 同目录）。
+- 验证：默认六条分类正确；自定义 `[can]` 规则命中且"首命中"优先于 FAIL；
+  改规则后已有行重着色、sys 提示行的 tag 保留；保存→重载后 7 条不重复、顺序稳定；
+  非法 fg/bg 回退默认色、`sel` 占用被拦截、内置标记以代码为准；设置窗口可打开。
+  测试写入的临时规则已从源码目录配置中清除。
+
+## 2026-11-24 20:01 — 颜色规则全部可删可改，取消"内置规则"保护
+
+### 问题（如有）
+
+用户点「删除」内置规则时被弹窗「内置规则不能删除，改关键词或颜色即可」拦住，
+明确要求"全部规则都能修改、随意更改"。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::规则常量` — 移除所有规则的 `builtin` 字段，
+  默认六条降级为"初始值"而非特权规则；注释说明删光/删 sys 的后果与恢复方式。
+- `Tools/SerialAssist/serial_assist.py::load_log_rules` — 删除"补齐缺失默认规则"
+  逻辑。这是关键：否则用户删掉的规则在关窗重开后会被自动补回，删除形同虚设。
+  现在 `log_rules` 键存在就以它为唯一来源（空列表也保持为空），
+  只有键不存在（首次运行/老版本）才回退 `default_log_rules()`。
+- `Tools/SerialAssist/serial_assist.py::open_color_settings::del_rule` — 移除内置
+  规则拦截弹窗，所有规则都能删；不需要确认弹窗（取消/关窗不落盘，误删可恢复默认）。
+  `add_rule` 不再写 `builtin` 字段。
+- `Tools/SerialAssist/serial_assist.py::_sys_line` — 加注释说明：sys 规则被删后
+  该 tag 未配置只是不着色（Tk 宽容），不会抛异常，无需在此补规则。
+- `Tools/SerialAssist/README.md::自定义日志颜色规则` — 改为"默认六条也能删"，
+  说明删光不崩、删 sys 后提示行变默认色、恢复默认可找回。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 20:01 重新打包，自检通过
+  （UI OK、串口 7 个、调试器 ST-Link V2-1 → interface/stlink.cfg、配置在 exe 同目录）。
+- 验证：删 `bad` + `sys` 两条内置规则后保存→重载，仍是剩下 4 条、被删的不复活、
+  规则里不再有 `builtin` 字段；删光全部规则后 `_apply_log_colors` / `_recolor_existing`
+  / `_classify` 均不崩、日志正常显示只是不着色、重载空表仍为空；设置窗口打开显示 6 条。
+  测试写入的临时规则已从源码目录配置中清除。
+
+## 2026-11-24 20:41 — 固件路径即时记忆 + 「检查更新」自动装填新 bin
+
+### 问题（如有）
+
+用户要求选 bin 时能记住上次路径，并在旁边加按钮检查固件有没有更新、有的话自动装填。
+确认范围：更新 = 当前选中的同一文件被重新编译（mtime/大小变化），不是扫目录找最新；
+检测到变化自动装填 + 接收区提示，不弹窗打断。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::_build_fw_card` — 「选择 .bin 文件」与新增的
+  「检查更新」按钮并排；检查按钮初始 disabled，没选文件时不可用。
+- `Tools/SerialAssist/serial_assist.py::__init__` — 新增 `self.fw_mtime`（选文件时
+  记录的 mtime 基准，初值 0）。
+- `Tools/SerialAssist/serial_assist.py::pick_file` — 选完调用 `_adopt_fw()`，
+  抽出的装填逻辑被 pick_file 和检查按钮共用，避免两处显示不一致。
+- `Tools/SerialAssist/serial_assist.py::_adopt_fw` — 2026-11-24 新增。更新 fw_path /
+  fw_size / fw_mtime / 文件名显示，启用检查按钮，**立即写 last_file 到 json**
+  （原来只在关窗时写，程序崩溃就丢路径），重置解析状态；announce=True 时打装填日志。
+- `Tools/SerialAssist/serial_assist.py::check_fw_update` — 2026-11-24 新增。
+  对比 mtime + size（只比 size 会漏掉"大小没变但重新编译"），变化则 `_adopt_fw`
+  自动装填并打"旧大小→新大小"；未变化/文件被删也各打一行提示。
+  不读内容算 CRC —— 发送时本来会读一遍，检查没必要重复。
+- `Tools/SerialAssist/serial_assist.py::_guess_fw_dir` — last_file 指向的文件被删时
+  退回其父目录，再不行才回退工程 build/Debug。
+- `Tools/SerialAssist/README.md::固件路径记忆与检查更新` — 新增一节说明路径记忆、
+  四种检查结果与不检测 CRC 的取舍；OTA 流程步骤补充检查更新用法。
+- `Tools/SerialAssist/dist/STM32_OTA_SerialAssist.exe` — 20:41 重新打包，自检通过
+  （UI OK、串口 7 个、调试器 ST-Link V2-1 → interface/stlink.cfg、配置在 exe 同目录）。
+- 验证：按钮初始 disabled；装填后大小/mtime 正确且 last_file 立即落盘；
+  未变化打"固件未变化"；改写 bin 后自动装填（100 B → 250 B）并打两行提示；
+  删掉 bin 后按钮置灰。测试用的临时路径已从配置恢复为原工程路径。
+
+## 2026-11-24 18:54 — 修复模式判定：F1 的 CAN_MODE_LOOPBACK 是位掩码，不是 2
+
+### 问题（如有）
+
+APP 按 CubeMX 生成后首次实机运行，串口打印：
+
+```
+[can] init OK, 500000 bps, sample 88.8%, normal
+[can] normal mode: self-test skipped (needs a peer)
+```
+
+但 `APP.ioc` 与 `can.c` 都是 `CAN_MODE_LOOPBACK`，实际就是回环模式，**回环自测被整段跳过**。
+
+根因（驱动自身的 bug）：F1 HAL 里 `CAN_MODE_LOOPBACK` 是位掩码 `CAN_BTR_LBKM`（0x40000000），
+`CAN_MODE_NORMAL` 是 0；而 `can_drv.h` 按 F4 的习惯把它写成 `NORMAL=1 / LOOPBACK=2`，
+`CanDrv_Init()` 又用 `(uint8_t)hcan.Init.Mode` 强转 —— 0x40000000 截断成 **0**，
+既不等于 1 也不等于 2，于是走 else 分支打印 "normal" 并跳过自测。
+
+危险之处在于**不报错**：`CanDrv_Init()` 仍返回 OK，只是少跑了一段最该跑的验证。
+
+### 改动
+
+- `APP/Application/BSP/CAN/can_drv.h` — `CANDRV_MODE_NORMAL` 1U→**0U**，`CANDRV_MODE_LOOPBACK`
+  2U→**1U**，并改写注释：明确这是驱动自己的语义值，**故意与 HAL 数值不同**，
+  不再声称「必须与 HAL 一致」（那句是错的）。
+- `APP/Application/BSP/CAN/can_drv.c::Map_HalMode` — 新增。按位判断 `hal_mode & CAN_BTR_LBKM`，
+  命中即回环（同时覆盖 `CAN_MODE_SILENT_LOOPBACK` 组合），否则 normal。按位而不是比数字，
+  换 HAL 系列/版本都不会静默错。
+- `APP/Application/BSP/CAN/can_drv.c::CanDrv_Init` — `s_mode` 赋值由 `(uint8_t)hcan.Init.Mode`
+  改为 `Map_HalMode((uint32_t)hcan.Init.Mode)`。
+- 验证：36 个源文件（编译数据库此时已含 `can_drv.c`）编译零错误零警告；链接通过
+  **RAM 8632B/20KB = 42.15%，FLASH 20628B/44KB = 45.78%**。
+- 待实机确认：重烧后应打印 `[can] init OK, ..., loopback` 与
+  `[can] loopback self-test PASS (tx=1 ovf=0 err=0 bof=0)`。
+- 附带记录（同日实机日志，非本次改动）：20608B 固件经 CAN 改造前的 UART 链路完整升级成功——
+  4 扇区 + 尾 128B 全部 `ok+verified`，`crc32=0xD46B092D`，Boot 搬运后 `flash crc` 一致、
+  状态转 APPLIED、App 确认擦标志。两级 OTA 底座未受本次 CAN 改造影响。
+
+## 2026-11-24 19:42 — 阶段 2：OTA 会话层（串口信令 + 按键确认 + READY 广播）
+
+### 问题（如有）
+
+阶段 1a 的 CAN 驱动就绪后，固件传输仍然是「串口有字节就开始写 Flash」——
+缺一道「这次真的要升级吗」的闸门，也缺一个上位机能看见的「我准备好了」信号。
+按方案 §10 阶段 2 补上：串口信令 → LED 快闪 → 操作者按 KEY2 → CAN 广播 READY。
+
+难点在于**串口是共用的**：现有 UART 收 bin 的路径已经实机验证过，不能为了加信令把它改坏。
+
+### 改动
+
+- `APP/Application/BSP/OTA/ota_session.h/.c` — 新建。状态机 `IDLE → ARMED → READY`
+  （阶段 3 再接 DOWNLOAD/VERIFY）；`OtaSession_Poll()` 每圈调一次，
+  **返回 0 才表示"什么都没发生"，主循环照旧走 bin 落盘路径**——现有升级流程零改动。
+  含：ASCII 命令解析（`+OTA:REQ` / `+OTA:CANCEL`）、BUSY 防重入、ARMED 30s / READY 10s 超时、
+  LED 语义（IDLE 慢闪由 main 管 / ARMED 100ms 快闪 / READY 常亮）、按键 40ms 去抖
+  （触发一次须松手才能再触发）、READY 帧广播（8 字节，ID = 0x581，含块大小 1024）。
+  非 IDLE 期间串口的非命令字节直接 `Uart_FlushRx` 丢弃 —— 避免误发的 bin 堆满环缓冲、
+  或取消后被当成固件写进 Flash。
+- `APP/Application/BSP/UART/uart_app.h/.c::Uart_Peek` — 新增。**只看不取**，读指针与
+  idle_flag 都不动。没有它就只能先 `Uart_Read` 再判断，而环形缓冲不支持回退：
+  取走的字节要么被当固件写进 Flash，要么丢进垃圾桶，两条都错。
+- `APP/Application/BSP/Board/board.h/.c::Board_Key2Pressed` — 新增。KEY2(PA1) 收进 board 层，
+  会话层不必 include main.h 去读引脚号，符合本层「上层只认函数名」的定位。不做去抖，
+  去抖窗口由调用方定（会话层用 40ms）。
+- `APP/Core/Src/main.c` — 改（先完整读过）。`USER CODE BEGIN Includes` 加 `ota_session.h`；
+  `USER CODE 2` 在确认/备份逻辑之后调 `OtaSession_Init()`；
+  主循环改为 `if (OtaSession_Poll() == 0U) { LED 500ms 慢闪 + Boot_Loader_Getlen() }`，
+  即非 IDLE 时串口与 LED 都交给会话层。
+  新增编译期护栏：`#if (OTA_TEST_CRASH == 1) #error` —— 该测试桩 mode 1 也读 KEY2，
+  与按键确认抢同一引脚（按一下既确认升级又制造 HardFault），必须阻止；回滚测试改用 mode 2。
+- `OTA_CAN_升级方案.md` — 新增 §5.0「串口信令」（命令表、与 bin 流的区分方式、已知限制）；
+  §12 进展表补阶段 2 一行。
+- 验证：37 个源文件（含新文件，EIDE 的编译数据库已自动收录 `ota_session.c`）
+  编译零错误零警告；链接通过 **RAM 8656B/20KB = 42.27%，FLASH 22184B/44KB = 49.24%**。
+- 待实机验证：
+  1. 串口发 `+OTA:REQ` → `[sess] REQ accepted -> ARMED, press KEY2 within 30000ms`，LED 快闪
+  2. 按 KEY2 ≥40ms → `[sess] KEY2 confirmed -> READY` + `[sess] CAN READY sent id=0x581 blk=1024B`，LED 常亮
+  3. 不按键等 30s → `[sess] ARMED timeout 30000ms -> IDLE`；READY 后等 10s → `READY timeout`
+  4. ARMED 时再发 `REQ` → `[sess] BUSY (state=1), REQ ignored`
+  5. `+OTA:CANCEL` → 回 IDLE
+  注：回环模式下 READY 帧会自己回环进接收队列（tx 计数 +1），属正常，阶段 3 由 ISO-TP 消费。
+
+## 2026-11-24 19:47 — 回退阶段 2（会话层），回到只有阶段 1a 的固件
+
+### 问题（如有）
+
+阶段 1a 的「模式判定」修复（`Map_HalMode`）尚未在硬件上验证通过，就叠加了阶段 2 的会话层。
+用户要求先做回环测试：底座没验穿就往上叠，出问题时无法区分是 CAN 驱动的问题还是状态机的问题。
+
+### 改动（全部为回退，无新增逻辑）
+
+- `APP/Application/BSP/OTA/ota_session.h`、`ota_session.c` — **删除**（本轮新增的文件）。
+- `APP/Application/BSP/UART/uart_app.h`、`uart_app.c` — `git checkout` 还原到 HEAD，
+  撤销新增的 `Uart_Peek()`。
+- `APP/Application/BSP/Board/board.h`、`board.c` — `git checkout` 还原到 HEAD，
+  撤销新增的 `Board_Key2Pressed()`。
+- `APP/Core/Src/main.c` — 撤掉 `#include "ota_session.h"`、`OtaSession_Init()` 调用、
+  `OTA_TEST_CRASH == 1` 的 `#error` 护栏，主循环还原为原来的
+  「500ms 慢闪 + `Boot_Loader_Getlen()`」。**阶段 1a 的 CAN 初始化与自测块保留不动。**
+- `OTA_CAN_升级方案.md` — §5.0 标题改为「设计草案，未实施」并注明回退原因；
+  §12 进展表把阶段 2 改回「未开始，曾实现后回退」。
+- 验证：编译 36 个源文件零错误零警告；链接 **RAM 8632B/20KB = 42.15%，
+  FLASH 20628B/44KB = 45.78%** —— 与加阶段 2 之前完全一致，证明回退干净。
+- 现固件行为：上电 → `[app] w25q init OK` → `[can] init OK, 500000 bps, sample 88.8%, loopback`
+  → `[can] loopback self-test PASS/FAIL` → 确认/备份逻辑 → 主循环串口收 bin。
+
+## 2026-11-24 19:55 — 阶段 1a 实机验证通过（CAN 回环自测 PASS）
+
+### 问题（如有）
+
+本条无代码改动，仅记录实机验证结果。此前「模式判定」修复（`Map_HalMode`）只在编译层面验证过，
+回环自测能否真正跑通未知。
+
+### 改动
+
+- 无代码改动。`OTA_CAN_升级方案.md`：状态行改为「阶段 1a 已实机验证通过」，
+  §12 进展表补上实机日志与「已证明 / 未证明」的边界。
+
+### 实机结论
+
+用户回传串口日志（固件 20628B，`crc=0xC3FBDE7B`，与本地编译产物一致）：
+
+```
+[app] w25q init OK
+[can] init OK, 500000 bps, sample 88.8%, loopback
+[can] loopback self-test PASS (tx=1 ovf=0 err=0 bof=0)
+[app] backup current fw OK (20628B)
+```
+
+由此确认以下环节全部正确：
+1. 位时序被硬件接受（否则外设进不了收发态，`CanDrv_Send` 直接失败）；
+2. 帧完整发出（`tx=1`，邮箱变空）；
+3. 帧被收进 FIFO0（否则 `RxPending()` 恒 0、超时）；
+4. **CAN1 RX0 中断与向量表正确**（这是 `USB_LP_CAN1_RX0_IRQHandler` 那个命名坑的真正闭环验证）；
+5. 回调取帧入队、队列搬运正确（8 字节逐字节比对一致）；
+6. `ovf=0 err=0 bof=0`：无 FIFO 溢出、无错误帧、未进 BusOff。
+
+**边界（写清楚免得后面误判）**：
+- 回环是 CAN 内核内部 TX→RX 短接，**不经过引脚**，故 PB8/PB9 的复用、`AFIO_REMAP_CAN1_2`、
+  收发器 STB(PB7) 待机状态、120Ω 终端、对端 ACK —— 全部未验证，留给阶段 1b。
+- 本测试只覆盖「帧被接受并送达」的成功路径；「过滤器会挡住别的 ID」这一拒收行为未验证，
+  因为即使回环帧完全绕过验收滤波，本测试同样会 PASS。
+
+同日三次完整 OTA 循环（收 bin → 落盘 → CRC → 标志 → 搬运 → 确认 → 备份）均正常，
+说明阶段 1a 的改造没有影响原有传输链路。
+
+## 2026-11-24 20:22 — ISO-TP 分帧/拼装 + 大数据回环自测（三步对照）
+
+### 问题（如有）
+
+阶段 1a 只验证了单帧收发。真实链路要传 20KB 固件，必须走 ISO-TP 多帧分包；
+而分帧是整条链路里最容易出 off-by-one 的地方（12 位长度、4 位序号、尾块不满 7 字节）。
+在接真实总线之前，先把这一层在回环里跑穿——否则一旦上总线，数据错了分不清是分包错还是线错。
+
+### 改动
+
+- `APP/Application/BSP/OTA/isotp.h/.c` — 新建（**正式代码，长期保留**）。
+  纯逻辑层：`IsoTp_TxInit/TxNext` 编码、`IsoTp_RxInit/RxFeed/RxDone` 解码。
+  不调 CAN、不碰 Flash、不打印，因此可脱机测试。
+  关键约定：12 位长度（max 4095）；**CF 序号从 1 开始**（1..15,0,1…，按直觉写 0 会全错一位）；
+  尾帧 `dlc` 按实际有效字节给，不为凑满 8 而填垃圾。
+  本版**不含 FC 流控**（回环下发送接收同在主循环，天然不灌爆），方案 §7 的块级流控留到接真总线时补。
+- `APP/Application/BSP/OTA/isotp_test.h/.c` — 新建（**夹具，用完可编译掉**）。
+  开关 `ISOTP_SELFTEST`（当前 1）。三步对照，一次烧录看全：
+  1) 139B / 20 帧，**一次全发完再收** → 预期 FAIL（接收队列 8 深度，实际可用 7 → 溢出丢帧）
+  2) 139B / 20 帧，每 4 帧收一次 → 预期 PASS
+  3) 1024B / 147 帧，每 4 帧收一次 → 预期 PASS
+  1 与 2 的数据、帧数、分帧逻辑完全相同，**只有节奏不同**，所以结果差异只能由节奏解释——
+  这是方案 §7「块级半双工」必须存在的现场证明。
+  数据源是内存递增图案（`i & 0xFF`），不接串口、不接 Flash；全零图案会掩盖错位，故不用。
+- `APP/Core/Src/main.c` — 改（先完整读过）。加 `#include "isotp_test.h"`；
+  在 CAN 单帧自测通过之后、同一分支内调用 `IsoTp_SelfTest()`。
+  顺序有意为之：单帧不通就不跑多帧，否则分帧错与链路错混在一起，日志全是 FAIL 却不知先修哪个。
+- 验证：38 个源文件编译零错误零警告；链接 **RAM 10680B/20KB = 52.15%（含 2KB 自测缓冲），
+  FLASH 22616B/44KB = 50.20%**。
+- 副作用：烧录后上电会多打 8~12 行 `[isotp]` 自测日志，全在启动阶段、不进入主循环；
+  验完把 `isotp_test.h` 的 `ISOTP_SELFTEST` 改 0，夹具整段消失（RAM 回落约 2KB）。
+
+## 2026-11-24 20:30 — 串口字节经 CAN 往返后再落盘（传输选择器接入）
+
+### 问题（如有）
+
+`isotp_test` 已证明分帧/拼装在回环下正确（20 帧与 147 帧均 PASS）。下一步要把拼回来的
+字节流真正接进 `OtaW25q_Feed`，让数据通路闭环，并保留旧路径作救砖。
+用户确认三点：① 攒够再发；② 2 秒 idle 判尾保留；③ 新老路径用编译开关二选一。
+
+### 改动
+
+- `APP/Application/BSP/OTA/ota_can_relay.h/.c` — 新建。**传输选择器**：
+  对外只暴露 `OtaRelay_Feed/Flush/Pending/Init`，开关 `OTA_LINK_VIA_CAN` 收在本模块内。
+  开 = 字节先攒成 1024 一块 → 分帧发到 CAN → 收回来拼装 → `OtaW25q_Feed`；
+  关 = 直接转调 `OtaW25q_Feed`（与改造前逐字节一致）。
+  这样 `Boot_Loader.c` 里**不出现任何 #if/#else**，两条路径不可能走岔。
+  节奏 `OTA_RELAY_PACE=4`（每发 4 帧收一次），等于 FC 的 BS 参数——取 4 的依据是
+  `CANDRV_RXQ_DEPTH=8` 判满后实际只有 7 帧可用，留一半余量；数据来自 isotp_test 的实测对照。
+  错误码 `RELAY_ERR_CAN(-20)` / `RELAY_ERR_ASSEMBLE(-21)` 与 `OTAW_ERR_*` 错开，便于分辨来源。
+- `APP/Application/App/Boot_Loader/Boot_Loader.c` — 改（先完整读过）。三处：
+  1) `Boot_Loader_Init()`：W25Q 绑定成功后调 `OtaRelay_Init()`（清暂存块 + 打一行传输方式）；
+  2) `Boot_Loader_Getlen()`：`OtaW25q_Feed(s_rx, rx_len)` → `OtaRelay_Feed(s_rx, rx_len)`；
+  3) idle 判尾条件增加 `|| (OtaRelay_Pending() > 0U)`。
+     **这一条不加就会丢尾**：暂存块里可能正躺着 800 字节没发出去，而此刻
+     `OtaW25q_Fill()` 还是 0，只看 Fill 永远等不到 Finish。
+- `APP/Application/App/Boot_Loader/Boot_Loader.c::Boot_Loader_Finish` — 在 `OtaW25q_Finish()`
+  之前加 `OtaRelay_Flush()`。放这里而不是 Getlen 里：Finish 是公开接口，任何调用点都必须
+  保证"最后那点零头不会凭空消失"。漏了它的典型现象是 VERIFY FAIL 但前面每个扇区都显示 ok。
+- 验证：39 个源文件编译零错误零警告；链接 **RAM 12736B/20KB = 62.19%，
+  FLASH 23272B/44KB = 51.65%**。
+  RAM 涨到 62% 是两块各 1024B 的暂存/拼装缓冲（relay 2KB）+ isotp_test 的 2KB 夹具。
+  把 `isotp_test.h` 的 `ISOTP_SELFTEST` 改 0 可回落约 2KB。
+- 待实机验证（预期日志）：
+  `[relay] CAN 往返已启用（块 1024B, pace 4）` → 传输中每 4KB 一行
+  `[wota] sector … ok+verified` → 收尾 `[wota] tail …` / `VERIFY OK` / `UPDATE FLAG SET`。
+  失败签名：`[relay] assemble FAIL` = 丢帧（pace 或队列问题）；
+  `[wota] TAIL FLUSH FAIL` = 尾块发送失败；`VERIFY OK` 但 CRC 与 bin 不符 = 数据错位。
+
+## 2026-11-24 21:22 — 回退到「阶段 1a 回环成功」的代码状态
+
+### 问题（如有）
+
+用户要求把代码退回到「回环自测第一次 PASS」那个时间点，去掉此后叠加的 ISO-TP 分帧、
+大数据自测夹具与传输选择器（relay）。理由：那一版是唯一在实机上被完整验证过的状态，
+其上叠加的多层在后续调试中反复干扰判断。
+
+### 改动（全部为回退，无新增逻辑）
+
+- `APP/Application/BSP/OTA/isotp.c`、`isotp.h` — **删除**（分帧/拼装核心）。
+- `APP/Application/BSP/OTA/isotp_test.c`、`isotp_test.h` — **删除**（大数据自测夹具）。
+- `APP/Application/BSP/OTA/ota_can_relay.c`、`ota_can_relay.h` — **删除**（串口字节经 CAN 往返再落盘）。
+- `APP/Application/App/Boot_Loader/Boot_Loader.c` — `git checkout` 还原到 HEAD。
+  撤销三处：`OtaRelay_Init()` 调用、`OtaW25q_Feed` → `OtaRelay_Feed`、
+  idle 判尾条件里的 `OtaRelay_Pending()`，以及 `Boot_Loader_Finish()` 里的 `OtaRelay_Flush()`。
+- `APP/Core/Src/main.c` — 撤掉 `#include "isotp_test.h"` 与 `IsoTp_SelfTest()` 调用块；
+  阶段 1a 的 CAN 初始化与单帧回环自测**原样保留**。
+- 验证：编译 36 个源文件零错误零警告；链接 **RAM 8632B/20KB = 42.15%，
+  FLASH 20628B/44KB = 45.78%**；转成 bin 后 crc32 = **0xC3FBDE7B**，
+  与「回环第一次 PASS」那次实机固件**完全一致**（字节级相同，不只是体积相同）。
+- 保留未动：`APP/Application/BSP/CAN/can_drv.c/.h`、`APP/APP.ioc`、`APP/Core/Src/can.c`、
+  `APP/Core/Src/stm32f1xx_it.c/.h`、以及 Recieve（Boot）侧移除 CAN 的全部改动。
+- 注意：芯片上目前烧的是 **0x0FDD4E32（23272B，带 relay 的版本）**，与本次回退后的
+  0xC3FBDE7B（20628B）**不是同一份**。要用新状态需重新烧录。
