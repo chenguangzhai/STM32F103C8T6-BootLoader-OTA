@@ -2476,3 +2476,24 @@ W25Q 是 SPI 外挂、不支持内存映射，`0x001000` 只是 W25Q 内部地�
 `python Tools/verify_build.py APP`：36 文件 FAIL 0 / LINK rc=0。**未上板、未生成 bin**（用户自编译）。
 验收判据：按 KEY2 后打 `[app] KEY2 rollback: flag APPLIED OK, reset...`，复位后 Boot 打
 `[apply] flag: state=APPLIED` → `[apply] ROLLBACK: restoring ...` → `[apply] rollback done`。
+
+## 2026-11-26 20:18 — ZET6 上位机工程纳入本仓版本管理
+
+### 问题（如有）
+
+整套 CAN OTA 的另一半代码（`host_computer_ZET6/`）此前按约定整目录忽略，只存在于本地磁盘，
+没有版本控制备份。本轮先上传 GitHub 时发现这个覆盖缺口；用户明确改为纳入本仓。
+
+### 改动
+
+- `.gitignore` — 删除 `host_computer_ZET6/` 整目录忽略，改为注释说明纳入理由。
+  `build/` 与 `*.elf` 已被全局规则挡住，编译产物不会上传（已用 `git status --untracked-files=all` 核对，
+  127 个待纳入文件中无 bin/elf/hex/exe）。
+- `host_computer_ZET6/.gitignore` — 新增忽略 `.eide/env.ini`（本机的空模板环境变量文件），
+  与 APP 工程保持一致（APP 侧从未跟踪该文件）。保留 `.eide/eide.yml` 与 `files.options.yml`。
+
+### 副作用与注意
+
+- 纳入的是 ZET6 上位机工程的**全部当前代码**，包括阶段 1 查询应答、阶段 2 分帧发送、
+  CRC 修复（CalcSlotDataCrc 走 SPI 读回）与空闲自动收尾——这些改动此前没有 git 备份。
+- 用户说明：后续硬件方案改为**两块 C8T6** 做 OTA，届时再改代码；本轮只做版本归档，不动任何源码。

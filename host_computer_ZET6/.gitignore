@@ -1,0 +1,17 @@
+# dot files
+/.vscode/launch.json
+/.settings
+/.eide/log
+/.eide.usr.ctx.json
+# 2026-11-26：本机 EIDE 环境变量文件，与 APP 工程保持一致（APP 侧从未跟踪）
+/.eide/env.ini
+
+# project out
+/build
+/bin
+/obj
+/out
+
+# eide template
+*.ept
+*.eide-template

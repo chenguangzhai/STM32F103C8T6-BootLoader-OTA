@@ -33,5 +33,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
-# 上位机 ZET6 独立工程（不属于本 Boot_Loader 仓库）
-host_computer_ZET6/
+# 2026-11-26：ZET6 上位机工程纳入本仓统一版本管理。
+# 原为 "host_computer_ZET6/" 整目录忽略，现移除——整套 OTA 的另一半代码此前无版本控制备份。
+# build/ 与 *.elf 已被上面的全局规则挡住，不会上传编译产物。
