@@ -11,7 +11,7 @@
  * 【布局】W25Q64 共 8MB：
  *   0x000000 ~ 0x0FFFFF  前 1MB：留给用户存"是否升级"标志（本模块不碰）
  *   0x100000 ~ 0x7FEFFF  固件区：bin 写这里（本模块）
- *   0x7FF000 ~ 0x7FFFFF  末 4KB：W25q_Test 自检专用（不冲突）
+ *   0x7FF000 ~ 0x7FFFFF  末 4KB：保留（原 W25Q 自检扇区，自检代码已移除）
  *
  * 用法：
  *   OtaW25q_Init(&hspi1, W25Q_CS_GPIO_Port, W25Q_CS_Pin);   上电一次

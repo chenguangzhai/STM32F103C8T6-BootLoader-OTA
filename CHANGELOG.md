@@ -2563,3 +2563,39 @@ KEY2 人工回滚、崩溃后 Boot 自动回滚——全部实机闭环。
   判为 SWD 复位抢在标志写稳定前的偶发时序，**未改代码**。
 - "自动回滚"不等于"崩了自动重启"：项目无看门狗，崩溃后仍需人工复位，Boot 在下次开机时恢复。
 - 本条与 20:22 的临时测试态改动一并提交，之后 main 上不再包含任何测试桩启用代码。
+
+## 2026-11-26 20:52 — 清理残留测试代码，只保留主线（第一层安全删除）
+
+### 问题（如有）
+
+OTA 全链路已实机验证完毕、源码为发布态，但仓库里仍留着几处历史测试残留：
+回滚测试桩（`OTA_TEST_CRASH`，宏已为 0、编译期剔除）、两侧从未被调用的 W25Q 上电自检
+（`w25q_test.c/.h`）、两个测试固件 bin。它们不影响运行，但会误导后来者，也占源码/仓库体积。
+用户明确选择「第一层：安全死代码」，要求删掉这些，保留 CAN 诊断设施。
+
+### 改动
+
+- `APP/Core/Src/main.c` — 删 `#include "w25q_test.h"`、测试桩宏定义及 11 行说明注释、
+  `#if (OTA_TEST_CRASH != 0)` 整段（24 行 HardFault 注入代码）、KEY2 注释里与测试桩对比的 3 行。
+- 删除 4 个死代码文件：`APP/Application/BSP/W25Q/w25q_test.c/.h`、
+  `Recieve/Application/BSP/W25Q/w25q_test.c/.h`。两侧 `main.c` 均未调用（Recieve 侧调用早已注释），
+  EIDE 的 `srcDirs` 含 `Application` 会被编译链接但永不执行。
+- 删除 2 个历史测试固件：`Tools/APP_crash_test.bin`、`Tools/APP_crash_always.bin`
+  （mode 1/2 测试桩产物，git 已跟踪）。
+- 清理指向已删文件的注释：`Recieve/main.c`（自检说明改为「从 git 历史恢复」）、
+  `Recieve/.../Boot_Loader.c`（去掉「与 W25q_Test 共用绑定」）、
+  `APP/.../ota_w25q.c/.h`（末扇区标注改为「保留」，去掉「与自检共用 SPI」）。
+
+### 副作用与注意
+
+- **固件行为完全不变**：测试桩宏本来就是 0（编译期已剔除）、自检函数从未被调用、
+  bin 是历史产物。不需要重新实机验证。
+- **CAN 回环自测 `CanDrv_SelfTest()` 特意保留**：它在 `.ioc=NORMAL` 下不执行，但与之共用的
+  `s_tx_ok/s_rx_overflow/s_err_count/s_busoff_count` 计数器和 `CanDrv_ActualBaudrate()/
+  ActualSamplePointPermille()` 被 `[can] init OK, 125000 bps` 日志使用，属主线诊断设施。
+- HAL/CMSIS 库里的 `HardFault_Handler`、`CAN_MODE_LOOPBACK`、`DEBUG` 宏、`#if 0` 一律未动——
+  它们是库代码/异常向量，名字像测试但删了会链接失败或破坏 HAL。
+- 所有被删内容在 git 历史（`13d2649` 及之前）中均可恢复。
+- 验证：APP 35 文件 FAIL 0 / LINK rc=0；Recieve 35 文件 FAIL 0 / LINK rc=0。
+  Recieve 的 `build/Debug/compile_commands.json` 里有 1 条指向已删 `w25q_test.c` 的陈旧条目，
+  已手工剔除（该文件在 `build/` 下、不进版本库，EIDE 下次构建会自动重建）。**未生成 bin**（用户自编译）。

@@ -64,9 +64,7 @@ static void Feed_To_Flash(const uint8_t *buf, uint16_t len)
 
 void Boot_Loader_Init(void)
 {
-	/* 显式绑定 W25Q64（SPI1 + PB0 片选）。
-	   W25q_Test() 内部也会绑一次，这里重复绑定无副作用（只是重写 CS 寄存器），
-	   但保证搬运不依赖"自检是否跑过"这个隐含前提 —— 自检被注释掉也能搬运。 */
+	/* 显式绑定 W25Q64（SPI1 + PB0 片选）：搬运不依赖"自检是否跑过"这个隐含前提。 */
 	(void)W25q_Init(&hspi1, W25Q_CS_GPIO_Port, W25Q_CS_Pin);
 
 	s_last_rx   = Board_Millis();

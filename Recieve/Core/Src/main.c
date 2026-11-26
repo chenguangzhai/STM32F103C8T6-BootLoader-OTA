@@ -27,7 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "board.h"
 #include "Boot_Loader.h"
-/* w25q_test.h 已移除：自检代码为回滚逻辑腾 Flash 让路，原因见 main() 里的说明。
+/* w25q_test.h 已删除（自检代码不再保留），原因见 main() 里的说明。
    ⚠ 2026-11-24：本行原先直接写出了「2 号用户代码段的开始标记」原文，CubeMX 用字符串
    查找定位用户代码段，会先命中这句注释，于是把 Includes 尾部到真正的结束标记之间整段
    当成用户代码重新插入 —— 生成出两个 int main()、工程编译不过。
@@ -105,11 +105,9 @@ int main(void)
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   Uart_Init();
-	/* W25Q64 自检已去掉（为回滚逻辑腾出约 1.4KB Flash，Boot 区只剩 880B）。
-	   自检只是开发阶段确认接线/ID 的辅助手段，功能验证已完成；
-	   W25q 的绑定改由 Boot_Loader_Init() 显式完成，不依赖自检副作用。
-	   需要重新排查硬件时，把下面这行取消注释即可（注意会超 Flash 预算）：
-	   (void)W25q_Test(); */
+	/* W25Q64 自检代码（w25q_test.c/.h）已随发布版从仓库移除：它只是开发阶段
+	   确认接线/ID 的辅助手段，功能验证早已完成；W25q 绑定由 Boot_Loader_Init()
+	   显式完成，不依赖自检副作用。需要重新排查硬件时从 git 历史恢复该文件。 */
 
 	/* 本轮新增：初始化片内 Flash 落盘链路（设写入起点 = App 区 0x08005000）。
 	   必须在 Uart_Init() 之后 —— 落盘进度日志走 UART_LOG，先开串口才打得出来。
@@ -118,7 +116,7 @@ int main(void)
 
 	/* 上电 3 秒窗口。窗口期内串口收到数据 -> 返回并留在 OTA 收 bin；
 	   一直没数据且 App 有效 -> 直接跳到 0x08005000，本函数不返回。
-	   W25q_Test() 自检已移除，本函数直接跟在 Boot_Loader_Init() 之后。 */
+	   自检代码已移除，本函数直接跟在 Boot_Loader_Init() 之后。 */
 	(void)Boot_Loader_BootWindow();
 
 	uint16_t len = 0;
