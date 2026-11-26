@@ -1,0 +1,57 @@
+{
+  "port": "COM25  USB 串行设备 (COM25)",
+  "baud": "115200",
+  "disp_mode": "UTF-8",
+  "autoscroll": true,
+  "timestamp": false,
+  "chunk": "256",
+  "delay": "1",
+  "auto_reset": true,
+  "last_file": "",
+  "geometry": "1x1+907+207",
+  "log_rules": [
+    {
+      "tag": "bad",
+      "name": "FAIL / ERROR",
+      "pattern": "FAIL|ERROR|error",
+      "fg": "#D93025",
+      "bg": "#FDECEA"
+    },
+    {
+      "tag": "boot",
+      "name": "[boot]",
+      "pattern": "[boot]",
+      "fg": "#7C3AED",
+      "bg": ""
+    },
+    {
+      "tag": "ota",
+      "name": "[ota]",
+      "pattern": "[ota]",
+      "fg": "#0E7490",
+      "bg": ""
+    },
+    {
+      "tag": "rst",
+      "name": "[rst]",
+      "pattern": "[rst]",
+      "fg": "#C77700",
+      "bg": ""
+    },
+    {
+      "tag": "good",
+      "name": "ok / OK",
+      "pattern": " ok|OK",
+      "fg": "#0F9D58",
+      "bg": ""
+    },
+    {
+      "tag": "sys",
+      "name": "系统提示",
+      "pattern": "",
+      "fg": "#6C7683",
+      "bg": ""
+    }
+  ],
+  "dual_mode": true
+}

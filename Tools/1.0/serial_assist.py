@@ -246,6 +246,59 @@ def human_bytes(n):
     return "{:.2f} MB".format(n / (1024.0 * 1024.0))
 
 
+def fit_dropdown(cb, labels, min_chars=15):
+    """让 combobox 的弹出列表按最长一项展开（收起时控件宽度不变）。
+
+    ttk 的下拉列表默认跟控件同宽，COM 口描述一长就被截成
+    "USB-SERIAL ..." / "蓝牙链接上的..."，看不出是哪个设备。
+    这里先改弹出 Listbox 的 -width（按像素量最长行再折算字符数，
+    中文按实际像素算）。注意光改 Listbox 还不够 —— ttk 在弹出时
+    会把整个 popdown 窗口的几何强制设成输入框宽度，所以还要配合
+    widen_popdown() 在弹出后把窗口本身再撑开一次。
+    """
+    try:
+        popdown = str(cb.tk.call("ttk::combobox::PopdownWindow", str(cb)))
+        lb = popdown + ".f.l"
+        from tkinter import font as tkfont
+        try:
+            f = tkfont.Font(root=cb, font=cb.tk.call(lb, "cget", "-font"))
+        except Exception:
+            f = tkfont.nametofont("TkDefaultFont")
+        px = max([f.measure(str(x)) for x in labels] or [0])
+        unit = max(f.measure("0"), 1)
+        cb.tk.call(lb, "configure", "-width",
+                   max(min_chars, px // unit + 2))
+    except Exception:
+        pass
+
+
+def widen_popdown(cb):
+    """把已经弹出的下拉窗口按内容宽度重新撑开一次。
+
+    ttk::combobox::PlacePopdown 里有一句
+        wm geometry $popdown ${w}x${H}+${x}+${Y}
+    w 取的是 combobox 自身宽度，所以展开列表永远和输入框一样宽，
+    长设备名必被截断。这里在弹出之后按 popdown 内 frame 的
+    请求宽度重设几何；超出屏幕右侧时往左挪一下，别跑到屏幕外。
+    """
+    try:
+        pop = str(cb.tk.call("ttk::combobox::PopdownWindow", str(cb)))
+        if not int(cb.tk.call("winfo", "ismapped", pop)):
+            return
+        need = int(cb.tk.call("winfo", "reqwidth", pop + ".f")) + 4
+        geo = str(cb.tk.call("wm", "geometry", pop))     # WxH+X+Y
+        wh, xs, ys = geo.split("+", 2)
+        h = int(wh.split("x")[1])
+        x, y = int(xs), int(ys)
+        sw = int(cb.tk.call("winfo", "screenwidth", pop))
+        if x + need > sw:
+            x = max(sw - need, 0)
+        cb.tk.call("wm", "geometry", pop,
+                   "{}x{}+{}+{}".format(need, h, x, y))
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------------ 调试器复位
 # 跑 SWD 复位的不一定是 DAP-Link：ST-Link、J-Link 都能干同一件事，
 # 区别只在 OpenOCD 要加载哪个 interface 脚本。下面这张表按 USB 的
@@ -265,15 +318,26 @@ DEBUGGERS = [
 ]
 
 
-def detect_debugger():
-    """认当前插着的调试器，返回 (接口脚本名, 显示名)：('stlink', 'ST-Link V2')。
+def detect_debuggers():
+    """枚举此刻插着的**全部**调试器，返回
+    [{'iface','name','serial','vidpid'}, ...]，按 DEBUGGERS 里的优先级排序。
 
-    只认「此刻真的连着」的设备。不能用注册表 Enum\\USB 判断 —— 拔掉的
-    设备键还留在里面，换调试器时会认成旧的那个，然后复位必然失败。
-    CFGMGR32 的 PRESENT 过滤才是准的。
+    2026-11-25 新增。原来的 detect_debugger() 只返回第一个命中项 —— 同时
+    插两块板（各自带调试器）时，OpenOCD 默认也只认第一个，另一块永远复位
+    不到。要指定复位哪一块，必须拿到每个调试器各自的序列号。
+
+    序列号取自 Windows devnode id 的最后一段：
+        USB\\VID_0483&PID_374B\\AE5A5BB50000000000078851   → AE5A5BB5...
+    复合设备的**接口**节点长这样：
+        USB\\VID_0483&PID_374B&MI_00\\8&12225435&0&0000
+    末段是总线拓扑编号（同一台设备的几个接口各不同、重插还会变），拿它
+    当序列号既认不准也会重复，所以必须跳过带 &MI_ 的节点。
+
+    只认「此刻真的连着」的设备：用 CFGMGR32 的 PRESENT 过滤，不用注册表
+    Enum\\USB（拔掉的键还留着，会认成旧设备）。
     """
     if os.name != "nt":
-        return None, None
+        return []
     try:
         import ctypes
         from ctypes import wintypes
@@ -285,20 +349,50 @@ def detect_debugger():
         if cm.CM_Get_Device_ID_List_SizeW(
                 ctypes.byref(size), None,
                 CM_GETIDLIST_FILTER_PRESENT) != 0:
-            return None, None
+            return []
         buf = ctypes.create_unicode_buffer(size.value)
         if cm.CM_Get_Device_ID_ListW(
                 None, buf, size.value,
                 CM_GETIDLIST_FILTER_PRESENT) != 0:
-            return None, None
-        ids = bytes(buf).decode("utf-16-le", "ignore").upper()
+            return []
+        raw = bytes(buf).decode("utf-16-le", "ignore")
     except Exception:
-        return None, None
+        return []
 
-    for vidpid, iface, label in DEBUGGERS:
-        if vidpid in ids:
-            return iface, label
-    return None, None
+    out = []
+    seen = set()
+    for devid in raw.split("\x00"):
+        if not devid:
+            continue
+        up = devid.upper()
+        if "&MI_" in up:
+            continue                    # 复合设备的接口节点，末段不是真序列号
+        for prio, (vidpid, iface, label) in enumerate(DEBUGGERS):
+            if vidpid not in up:
+                continue
+            serial = devid.split("\\")[-1]
+            key = (iface, serial.upper())
+            if key in seen:             # 同一设备可能有两个设备节点，去重
+                break
+            seen.add(key)
+            out.append({"iface": iface, "name": label,
+                        "serial": serial, "vidpid": vidpid, "prio": prio})
+            break
+    # 排序让"第一个"与旧行为一致：优先 DEBUGGERS 表里的顺序
+    out.sort(key=lambda d: (d["prio"], d["serial"].upper()))
+    return out
+
+
+def detect_debugger():
+    """兼容旧调用：只取优先级最高的那个，返回 (接口脚本名, 显示名)。
+
+    2026-11-25：实现改为走 detect_debuggers()，行为与原来一致
+    （仍按 DEBUGGERS 表顺序取第一个）。
+    """
+    found = detect_debuggers()
+    if not found:
+        return None, None
+    return found[0]["iface"], found[0]["name"]
 
 
 def find_openocd():
@@ -326,8 +420,19 @@ def find_openocd():
 
 
 def openocd_reset(exe, scr, interface="cmsis-dap", target="stm32f1x",
-                  timeout=25):
-    """让调试器复位目标板并放开运行。返回 (成功?, 说明文本)"""
+                  timeout=25, serial=""):
+    """让调试器复位目标板并放开运行。返回 (成功?, 说明文本)
+
+    serial 非空时用 `adapter serial` 锁定到那个调试器实例。
+    2026-11-25 新增：同时插两块板时，OpenOCD 默认挑第一个匹配的调试器，
+    两个串口助手实例会一起复位同一块板，另一块永远不动 —— 这就是
+    「一块能复位、另一块识别不到」的根因。
+
+    注意 `adapter serial` 必须放在 -f interface/*.cfg **之后**（那里才有
+    adapter driver）、init **之前**；顺序错了会报 unknown command。
+    已实测：填一个不存在的序列号，DAP-Link 报 "unable to find a matching
+    CMSIS-DAP device"、ST-Link 报 "open failed"，说明该参数确实在起过滤作用。
+    """
     icfg = os.path.join(scr, "interface", interface + ".cfg")
     tcfg = os.path.join(scr, "target", target + ".cfg")
     if not os.path.isfile(icfg):
@@ -335,8 +440,10 @@ def openocd_reset(exe, scr, interface="cmsis-dap", target="stm32f1x",
     if not os.path.isfile(tcfg):
         return False, "找不到芯片配置：{}".format(tcfg)
 
-    cmd = [exe, "-f", icfg, "-f", tcfg,
-           "-c", "init; reset run; shutdown"]
+    cmd = [exe, "-f", icfg, "-f", tcfg]
+    if serial:
+        cmd += ["-c", "adapter serial {}".format(serial)]
+    cmd += ["-c", "init; reset run; shutdown"]
     # Windows 下别弹出黑色控制台窗口
     flags = 0x08000000 if os.name == "nt" else 0
     try:
@@ -474,42 +581,198 @@ class OtaSerialApp(object):
         2026-11-24：从 __init__ 抽出，供「刷新软件」复用。
         注意配置里手写的 ocd_iface 优先于现场探测 —— 那是给"认错了"
         留的逃生口，刷新时不能悄悄覆盖用户明确写下的选择。
+
+        2026-11-25：改为枚举**全部**在位调试器（self.ocd_debuggers），
+        支持按序列号指定复位哪一块板（self.ocd_serial）。
         """
         self.ocd_exe, self.ocd_scr = find_openocd()
 
-        # 调试器类型：配置里显式指定 > 现场探测 > 默认按 DAP-Link 猜
-        _probed_iface, _probed_name = detect_debugger()
-        self.ocd_iface = (self.cfg.get("ocd_iface") or _probed_iface
+        # 全部在位的调试器，供「复位目标」下拉框列出
+        self.ocd_debuggers = detect_debuggers()
+
+        # 用户在配置里锁定过序列号就用它；否则空串 = 自动（第一个）
+        self.ocd_serial = str(self.cfg.get("ocd_serial") or "")
+
+        # 选中的设备：优先按序列号匹配，匹配不到再看第一个
+        sel = None
+        if self.ocd_serial:
+            for d in self.ocd_debuggers:
+                if d["serial"].upper() == self.ocd_serial.upper():
+                    sel = d
+                    break
+        else:
+            sel = self.ocd_debuggers[0] if self.ocd_debuggers else None
+
+        # 调试器类型：配置里显式指定 > 选中设备的类型 > 现场第一个 > 按 DAP-Link 猜
+        probed_iface = sel["iface"] if sel else None
+        probed_name = sel["name"] if sel else None
+        self.ocd_iface = (self.cfg.get("ocd_iface") or probed_iface
                           or "cmsis-dap")
         self.ocd_target = self.cfg.get("ocd_target", "stm32f1x")
-        self.ocd_name = _probed_name or {
+        self.ocd_name = probed_name or {
             "cmsis-dap": "DAP-Link",
             "stlink":    "ST-Link",
             "jlink":     "J-Link",
         }.get(self.ocd_iface, self.ocd_iface.upper())
 
+        # 配置里锁定的序列号此刻不在位：不要静默换成别的板子复位，
+        # 宁可让 OpenOCD 报"找不到设备"，也别复位错了目标
+        self.ocd_serial_missing = bool(
+            self.ocd_serial and sel is None)
+
+        self._refresh_debugger_ready()
+        return probed_iface, probed_name
+
+    def _refresh_debugger_ready(self):
+        """按当前 ocd_iface 重算「接口脚本存在 + 整体就绪」。
+
+        2026-11-25：从 _probe_debugger 抽出。切换「复位目标」时只有 iface
+        变了、不必重扫 USB，所以这段要能单独调。
+        """
         # 接口脚本必须真的存在，否则 OpenOCD 一启动就报错，不如提前置灰
         self.ocd_iface_ok = bool(
             self.ocd_scr
             and os.path.isfile(os.path.join(self.ocd_scr, "interface",
                                             self.ocd_iface + ".cfg")))
         self.ocd_ready = bool(self.ocd_exe) and self.ocd_iface_ok
-        return _probed_iface, _probed_name
+
+    def _current_debugger(self):
+        """当前选中的那台调试器字典；自动模式取第一台，没有则 None。
+
+        2026-11-25 新增，供下拉框同步和类型不匹配提示共用。
+        """
+        if self.ocd_serial:
+            for d in self.ocd_debuggers:
+                if d["serial"].upper() == self.ocd_serial.upper():
+                    return d
+            return None                 # 锁定的那台不在位
+        return self.ocd_debuggers[0] if self.ocd_debuggers else None
+
+    def _dbg_labels(self):
+        """生成「复位目标」下拉项：第 0 项是自动，之后每台调试器一项。
+
+        2026-11-25 新增。序列号只显示末 8 位 —— 卡片宽度有限，完整串
+        16~24 位会把下拉框撑得很宽；末 8 位足够区分同型号的两台设备，
+        完整串在下面那行提示里给出。
+        """
+        labels = ["自动（第一个）"]
+        for d in self.ocd_debuggers:
+            sn = d["serial"]
+            labels.append("{} · {}".format(d["name"], sn[-8:] if sn else "无序列号"))
+        return labels
+
+    def _sync_debugger_combo(self):
+        """把已锁定的序列号反映到下拉框（启动/刷新/切换后都要调）。"""
+        if not hasattr(self, "cb_dbg"):
+            return
+        self.cb_dbg["values"] = self._dbg_labels()
+        idx = 0
+        if self.ocd_serial:
+            for i, d in enumerate(self.ocd_debuggers, start=1):
+                if d["serial"].upper() == self.ocd_serial.upper():
+                    idx = i
+                    break
+        self.cb_dbg.current(idx)
 
     def _apply_debugger_ui(self):
-        """把 ocd_* 状态同步到复位按钮和底部提示（探测完必须调一次）。
+        """把 ocd_* 状态同步到复位按钮、复位目标下拉和底部提示。
 
         2026-11-24：从 _build_fw_card 抽出，刷新后不用重建控件就能更新。
+        2026-11-25：增加下拉框同步与三种异常提示（锁定的调试器不在位、
+        配置锁定的 interface 与实际设备类型不符、多台在位）。
         """
+        self._sync_debugger_combo()
+        cur = self._current_debugger()
+        hint_iface = self.cfg.get("ocd_iface")
+
         if not self.ocd_exe:
             self.ocd_hint.set("未找到 OpenOCD，请手动按板子复位")
+            ok_color = False
         elif not self.ocd_iface_ok:
             self.ocd_hint.set("OpenOCD 缺 interface/{}.cfg，请手动复位".format(
                 self.ocd_iface))
+            ok_color = False
+        elif self.ocd_serial_missing:
+            self.ocd_hint.set("锁定的调试器不在位（{}），复位会失败 —— "
+                              "请重新插或换目标".format(self.ocd_serial[-8:]))
+            ok_color = False
+        elif hint_iface and cur and hint_iface != cur["iface"]:
+            # 配置里手写 ocd_iface 是逃生口，但和设备类型不符时提示一句：
+            # 这时 OpenOCD 会用错脚本、连不上，症状很容易被误判成硬件问题
+            self.ocd_hint.set("注意：配置锁定 interface/{}，与当前设备 {} 不符".format(
+                hint_iface, cur["name"]))
+            ok_color = False
         else:
-            self.ocd_hint.set("SWD 复位就绪 · " + self.ocd_name)
-        self.lb_ocd_hint.configure(fg=C_OK if self.ocd_ready else C_BAD)
+            n = len(self.ocd_debuggers)
+            extra = "（{} 台在位）".format(n) if n > 1 else ""
+            self.ocd_hint.set("SWD 复位就绪 · {}{}".format(self.ocd_name, extra))
+            ok_color = True
+
+        self.lb_ocd_hint.configure(fg=C_OK if ok_color else C_BAD)
         self.btn_rst.configure(state="normal" if self.ocd_ready else "disabled")
+
+    def _rescan_debuggers(self, _evt=None):
+        """点开「复位目标」下拉前，轻量重扫一遍在位调试器。
+
+        2026-11-25 新增。只重扫 USB 设备节点，不动串口、不清日志 ——
+        刚插上的板子不用先点「刷新软件」（那会断串口并清屏）。
+        绑定在 <Button-1> 上，先于 ttk 的弹出类绑定执行，所以本次弹出的
+        列表里就能看到新设备。
+        """
+        self.ocd_debuggers = detect_debuggers()
+        self.ocd_serial_missing = bool(
+            self.ocd_serial and self._current_debugger() is None)
+        if not self.ocd_serial and self.ocd_debuggers:
+            # 自动模式：跟随"第一个"，名字也要跟着换
+            self.ocd_name = self.ocd_debuggers[0]["name"]
+            if not self.cfg.get("ocd_iface"):
+                self.ocd_iface = self.ocd_debuggers[0]["iface"]
+        self._refresh_debugger_ready()
+        self._apply_debugger_ui()
+
+    def _on_pick_debugger(self, _evt=None):
+        """用户在下拉框里换「复位目标」：立刻落盘并同步状态。
+
+        2026-11-25 新增。为什么选完就写配置、不等关窗：两个串口助手实例
+        共用一个 assist_config.json，谁的窗口先关谁就把选择写进去；
+        当场写能让"我现在要复位这块"这个意图立刻生效，不依赖关窗顺序。
+        """
+        idx = self.cb_dbg.current()
+        if idx <= 0:
+            self.ocd_serial = ""
+            label = "自动（第一个）"
+            cur = self.ocd_debuggers[0] if self.ocd_debuggers else None
+            if cur:
+                self.ocd_name = cur["name"]
+                if not self.cfg.get("ocd_iface"):
+                    self.ocd_iface = cur["iface"]
+        else:
+            d = self.ocd_debuggers[idx - 1]
+            self.ocd_serial = d["serial"]
+            # ocd_name 必须跟着换：提示行和 --check 打印都用它，不更新的话
+            # 界面会一直显示上一台调试器的名字，比不显示更容易误导
+            self.ocd_name = d["name"]
+            label = "{} · {}".format(d["name"], d["serial"][-8:] if d["serial"]
+                                     else "无序列号")
+            # 配置里没锁死 interface 时，跟着设备类型走（ST-Link / DAP-Link
+            # 用的 interface 脚本不同）；锁死过就尊重用户的选择，只提示。
+            if not self.cfg.get("ocd_iface"):
+                self.ocd_iface = d["iface"]
+
+        self.ocd_serial_missing = False if not self.ocd_serial else \
+            (self._current_debugger() is None)
+        self._refresh_debugger_ready()
+        self._apply_debugger_ui()
+
+        # 同步内存里的 cfg 再落盘：「刷新软件」走 _probe_debugger()，
+        # 它从 self.cfg 读 ocd_serial —— 只写磁盘不更新内存的话，
+        # 刚选好的目标会在下一次刷新时被旧配置覆盖回去（实测踩到过）。
+        self.cfg["ocd_serial"] = self.ocd_serial
+        cfg = load_config()
+        cfg["ocd_serial"] = self.ocd_serial
+        save_config(cfg)
+        self._sys_line("--- 复位目标：{}{} ---".format(
+            label, "" if self.ocd_serial else "（不指定序列号）"))
 
     # ---------------------------------------------------------------- ttk 主题
     def _init_style(self):
@@ -575,6 +838,15 @@ class OtaSerialApp(object):
                                     width=26, state="readonly",
                                     font=(FONT_MONO, 9))
         self.port_cb.pack(side="left", padx=(6, 4))
+
+        # ttk 弹出时会把下拉窗口压成输入框宽度（combobox.tcl 的
+        # PlacePopdown），只改列表宽度没用 —— 点开后再把窗口撑宽一次。
+        # 用 after(30) 而不是 after_idle：Post 内部会先跑 update idletasks，
+        # 用 idle 会在 PlacePopdown 之前执行，宽度又被压回去。
+        def _fit_port_popdown(_evt=None):
+            self.port_cb.after(30, lambda: widen_popdown(self.port_cb))
+        self.port_cb.bind("<Button-1>", _fit_port_popdown, add="+")
+        self.port_cb.bind("<F4>", _fit_port_popdown, add="+")
 
         ttk.Button(bar, text="刷新", width=6,
                    command=self.refresh_ports).pack(side="left", padx=(0, 14))
@@ -1075,13 +1347,31 @@ class OtaSerialApp(object):
         ttk.Button(rf, text="唤醒", width=5, command=self.wake_ota).grid(
             row=0, column=1, sticky="ew")
 
+        # 2026-11-25：新增「复位目标」——同时插两块板（各带一个调试器）时，
+        # OpenOCD 默认只认第一个，两个串口助手实例会一起复位同一块板，
+        # 另一块永远不动，这就是"复位只能复位一个板子"的根因。
+        # 下拉按调试器序列号区分，选中后立刻写配置（见 _on_pick_debugger）。
+        tk.Label(c, text="复位目标", bg=C_PANEL, fg=C_SUB,
+                 font=(FONT_UI, 8)).grid(row=8, column=0, sticky="w",
+                                         pady=(6, 0))
+        self.dbg_sel_var = tk.StringVar()
+        self.cb_dbg = ttk.Combobox(c, textvariable=self.dbg_sel_var, width=20,
+                                   state="readonly", font=(FONT_UI, 8))
+        self.cb_dbg.grid(row=8, column=1, sticky="e", pady=(6, 0))
+        self.cb_dbg.bind("<<ComboboxSelected>>", self._on_pick_debugger)
+        # 2026-11-25：点开下拉前先重扫一遍 USB —— 刚插上的板子不必先点
+        # 「刷新软件」（那个会断串口、清日志，代价太大）。这里是轻量的：
+        # 只更新设备列表，不动串口和接收区。
+        self.cb_dbg.bind("<Button-1>", self._rescan_debuggers)
+
         # 调试器状态一行说明，找不到时告诉用户原因。
         # 2026-11-24：label 存引用，刷新后由 _apply_debugger_ui 改文字/颜色；
         # 复位按钮的可用性也归它管，两处状态不能各写一份。
+        # 2026-11-25：行号从 8 让到 9，给「复位目标」腾位置。
         self.ocd_hint = tk.StringVar()
         self.lb_ocd_hint = tk.Label(c, textvariable=self.ocd_hint, bg=C_PANEL,
                                     font=(FONT_UI, 7), anchor="w")
-        self.lb_ocd_hint.grid(row=8, column=0, columnspan=2, sticky="ew",
+        self.lb_ocd_hint.grid(row=9, column=0, columnspan=2, sticky="ew",
                               pady=(3, 0))
         self._apply_debugger_ui()
 
@@ -1209,10 +1499,21 @@ class OtaSerialApp(object):
             self._sys_line("--- 调试器：未识别到在位的 DAP/ST/J-Link，"
                            "SWD 复位不可用，可手动按复位键 ---")
 
+        # 2026-11-25：多台在位时把清单打出来，方便确认「复位目标」该选哪个。
+        # 只打了末 8 位序列号：完整串太长，而这一行的用途是"对号"。
+        if len(self.ocd_debuggers) > 1:
+            self._sys_line("--- 在位调试器 {} 台：{} ---".format(
+                len(self.ocd_debuggers),
+                "，".join("{}·{}".format(
+                    d["name"], d["serial"][-8:] if d["serial"] else "无序列号")
+                    for d in self.ocd_debuggers)))
+
     def refresh_ports(self):
         ports = list_serial_ports()
         values = [d for _, d, _ in ports]
         self.port_cb["values"] = values
+        # 下拉列表按最长设备名加宽，避免长描述被截断
+        fit_dropdown(self.port_cb, values)
         if not values:
             self.port_var.set("")
             return
@@ -1684,7 +1985,8 @@ class OtaSerialApp(object):
 
         def work():
             ok, info = openocd_reset(self.ocd_exe, self.ocd_scr,
-                                     self.ocd_iface, self.ocd_target)
+                                     self.ocd_iface, self.ocd_target,
+                                     serial=self.ocd_serial)
             self.rx_queue.put(("sys",
                                "--- SWD 复位 {}：{} ---".format(
                                    "成功" if ok else "失败", info)))
@@ -1832,7 +2134,8 @@ class OtaSerialApp(object):
                 # 走 SWD 复位。DAP-Link 的 CDC 串口只透传 TX/RX，
                 # DTR/RTS 不接目标板 NRST，串口侧脉冲对它是空操作。
                 ok, info = openocd_reset(self.ocd_exe, self.ocd_scr,
-                                         self.ocd_iface, self.ocd_target)
+                                         self.ocd_iface, self.ocd_target,
+                                         serial=self.ocd_serial)
                 self.rx_queue.put(("sys", "--- SWD 复位 {}：{} ---".format(
                     "成功" if ok else "失败", info)))
                 if ok:
@@ -1947,7 +2250,8 @@ class OtaSerialApp(object):
 
             time.sleep(0.3)          # 让 tail 那页的擦写彻底结束
             ok, info = openocd_reset(self.ocd_exe, self.ocd_scr,
-                                     self.ocd_iface, self.ocd_target)
+                                     self.ocd_iface, self.ocd_target,
+                                     serial=self.ocd_serial)
             self.rx_queue.put(("sys",
                 "--- 自动复位 {}：{} ---".format(
                     "成功" if ok else "失败", info)))
@@ -1980,7 +2284,12 @@ class OtaSerialApp(object):
     def on_close(self):
         self.reader_alive = False
         self.abort_evt.set()
-        save_config({
+        # 2026-11-25：改成"读旧配置再覆盖本次要写的键"，不再整份替换。
+        # 原实现传的是一个全新字典，json 里不由界面维护的键（手写的
+        # ocd_iface / ocd_target，以及新增的 ocd_serial）会在关窗时被静默
+        # 丢掉 —— 症状是手写配置"过一会儿自己就没了"。
+        cfg = load_config()
+        cfg.update({
             "port": self.port_var.get(),
             "baud": self.baud_var.get(),
             "disp_mode": self.disp_mode.get(),
@@ -1992,8 +2301,11 @@ class OtaSerialApp(object):
             "last_file": self.fw_path.get(),
             # 2026-11-24：颜色规则表随配置持久化，拷走 json 就等于换工程带走规则
             "log_rules": [dict(r) for r in self.log_rules],
+            # 2026-11-25：复位目标（调试器序列号），空串 = 自动选第一个
+            "ocd_serial": self.ocd_serial,
             "geometry": self.root.geometry(),
         })
+        save_config(cfg)
         try:
             if self.ser:
                 self.ser.close()
@@ -2033,6 +2345,14 @@ def main():
             print("debugger: {} -> interface/{}.cfg [{}]".format(
                 app.ocd_name, app.ocd_iface,
                 "ready" if app.ocd_ready else "unavailable"))
+            # 2026-11-25：自检里列出全部在位调试器与当前复位目标，
+            # 打包后不接 GUI 也能确认"两块板都认到了、复位打的是哪一块"
+            print("debuggers({}): {}".format(
+                len(app.ocd_debuggers),
+                ", ".join("{}@{}".format(d["name"], d["serial"] or "-")
+                          for d in app.ocd_debuggers) or "-"))
+            print("reset target: {}".format(
+                app.ocd_serial or "auto(first)"))
             print("config: {}".format(CONFIG_PATH))
         root.destroy()
         return
