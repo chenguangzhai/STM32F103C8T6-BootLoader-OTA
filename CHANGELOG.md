@@ -1198,3 +1198,1281 @@ APP 按 CubeMX 生成后首次实机运行，串口打印：
   `APP/Core/Src/stm32f1xx_it.c/.h`、以及 Recieve（Boot）侧移除 CAN 的全部改动。
 - 注意：芯片上目前烧的是 **0x0FDD4E32（23272B，带 relay 的版本）**，与本次回退后的
   0xC3FBDE7B（20628B）**不是同一份**。要用新状态需重新烧录。
+
+## 2026-11-25 09:33 — ZET6 上位机工程补齐 CAN 回环自测（APP 阶段 1a 移植）
+
+### 问题（如有）
+
+用户确认下一步目标是「ZET6 作上位机、C8T6 作下位机走 CAN 通信」，但 `host_computer_ZET6`
+工程此前完全没有 CAN：`.ioc` 无 CAN 条目、HAL 配置里 `HAL_CAN_MODULE_ENABLED` 被注释、
+没有 `can.c/h`、没有 HAL CAN 驱动源文件、中断向量仍是启动文件的弱别名。
+按用户确认的范围，本轮**只做 ZET6 本地回环自测**，C8T6 侧一行不动，串口链路也不建
+（用户澄清前一句"串口通信"是口误，实际说的是 CAN 通信）。
+
+### 改动
+
+- `host_computer_ZET6/Boot_Loader.ioc` — 按 APP.ioc 原样补 CAN 配置：
+  `Prescaler=4 / BS1=15TQ / BS2=2TQ / Loopback / ABOM+NART+RFLM=ENABLE`
+  （500kbps、采样点 88.9%），PB8=CAN_RX / PB9=CAN_TX（`__HAL_AFIO_REMAP_CAN1_2`），
+  NVIC 勾 `USB_LP_CAN1_RX0_IRQn` + `CAN1_SCE_IRQn`，IP 列表与初始化顺序同步。
+  用脚本按 CRLF 原格式写入，行数 179→201。
+- `host_computer_ZET6/Core/Inc/can.h`、`Core/Src/can.c` — 从 APP 复制的 CubeMX 生成物，
+  参数与本工程 `.ioc` 一致；`can.c` 中 `MX_CAN_Init()` 只做 HAL 初始化，不启动外设。
+- `host_computer_ZET6/Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_can.h`、
+  `Src/stm32f1xx_hal_can.c` — 从 APP 复制。复制前用 sha256 对比 `stm32f1xx_hal_spi.c/h`
+  与 `stm32f1xx.h`，确认两工程 HAL/CMSIS 同版本，避免混版。
+- `host_computer_ZET6/Core/Inc/stm32f1xx_hal_conf.h` — 打开 `HAL_CAN_MODULE_ENABLED`；
+  否则 HAL CAN 的 include 与驱动实现都会被条件编译掉，链接找不到符号。
+- `host_computer_ZET6/Core/Src/stm32f1xx_it.c` / `Core/Inc/stm32f1xx_it.h` — 增加
+  `extern CAN_HandleTypeDef hcan;` 与 `USB_LP_CAN1_RX0_IRQHandler` / `CAN1_SCE_IRQHandler`
+  入口（都只调 `HAL_CAN_IRQHandler`），并补原型。向量名照高密度 F103 启动文件，
+  不能写成 `CAN1_RX0_IRQHandler`——写错链接不报错、中断落进 Default_Handler，
+  症状是「初始化成功但永远收不到帧」。处理函数放在 CubeMX 生成区，
+  将来在图形界面重新生成时会被同名生成物替换，不会重复定义。
+- `host_computer_ZET6/Application/BSP/CAN/can_drv.h`、`can_drv.c` — 从 APP 已实机验证版
+  移植，结构、读回校验、8 帧接收队列、发送邮箱等待、错误计数、自测图案全部保留。
+  **唯一实质差异**：ZET6 是上位机，过滤器与自测帧改用 `CANDRV_ID_RSP`(0x581)
+  而不是 APP 的 `CANDRV_ID_REQ`(0x601)。理由：真实总线上 ZET6 要收的是 C8T6 的应答
+  0x581；若照抄下位机的 0x601，回环照样 PASS，但接上总线后收不到对端应答，
+  而且自己发出的命令会回灌进接收队列。两处已加注释说明，改回 1:1 照抄只需换宏。
+- `host_computer_ZET6/Core/Src/main.c` — `USER CODE` 区加 `can_drv.h`，生成区加 `can.h`；
+  在 `Uart_Init()` 之后、OTA 搬运/窗口之前插入初始化与自测块，打印
+  `[can] init OK, %lu bps, sample %u.%u%%, loopback` 和
+  `[can] loopback self-test PASS/FAIL (tx=.. ovf=.. err=.. bof=..)`。
+  放在 UART 之后是为了日志能出来；放在 OTA 之前是为了让「CAN 通不通」和
+  「升级流程对不对」两类问题不混在一起。非回环模式明确跳过自测，避免误导性 FAIL。
+- `host_computer_ZET6/cmake/stm32cubemx/CMakeLists.txt` — 源清单补 `Core/Src/can.c`
+  与 `stm32f1xx_hal_can.c`，CMake 构建路径不会漏文件。
+- 验证：按 EIDE 的 `compile_commands.json` 同款参数编译全部 **37 个源文件，零错误零警告**；
+  完整链接通过（**RAM 8408B/64KB = 12.83%，FLASH 26972B/512KB = 5.14%**）。
+  `nm` 确认 `CanDrv_Init/Send/SelfTest`、两个 CAN 中断入口、HAL CAN 实现都在 ELF 中；
+  导出 `.isr_vector` 核对 IRQn 20/22 分别指向 `0x08002615`/`0x08002621`
+  （Thumb 位已置位，对应两个处理函数），不再落 Default_Handler。
+  生成 `build/Debug/host_computer_ZET6_CAN_loopback.bin`：26972B，crc32=0xEA270E24。
+- 待实机验证（**本轮未上板**）：烧到 ZET6 的 `0x08000000` 后，串口应打印
+  `[can] init OK, 500000 bps, sample 88.8%, loopback` 与
+  `[can] loopback self-test PASS (tx=1 ovf=0 err=0 bof=0)`。
+  边界与 APP 阶段 1a 相同：回环在 CAN 内核内部完成，**不经过 PB8/PB9、AFIO remap、
+  收发器、120Ω 终端、对端 ACK**；这些要等接上 C8T6 后另测。
+- 注意：`.ioc` 是脚本按 CubeMX 格式手改的，首次在 CubeMX 打开时请确认 CAN 配置项与上面一致；
+  图形界面重新生成会覆盖手写的 `can.c/h` 和中断入口，但参数同源、不会打架。
+
+## 2026-11-25 10:25 — 修复 ZET6 回环自测 init FAIL code=-2
+
+### 问题（如有）
+
+用户烧录 09:33 版 bin 后，串口打印 `[can] init FAIL code=-2`，其余启动日志正常。
+`CANDRV_ERR_STATE(-2)` 在 `CanDrv_Init()` 里只有一个来源：`HAL_CAN_GetState(&hcan)`
+不是 `HAL_CAN_STATE_READY`。查 `main.c` 确认：`MX_CAN_Init()` 有定义、`.ioc` 的
+functionlistsort 也排了顺序，但外设初始化序列里**漏掉了对它的调用**，`hcan` 一直停在
+RESET。这不是位时序或过滤器问题——那两种情况分别返回 -6 和 -7。
+编译链接能通过是因为函数存在、符号能解析，只有上板才暴露。
+
+### 改动
+
+- `host_computer_ZET6/Core/Src/main.c` — 在 `MX_USART1_UART_Init()` 之后、`MX_SPI2_Init()`
+  之前补 `MX_CAN_Init();`，顺序与 `.ioc` 一致。加注释说明漏掉时的症状，避免以后
+  看到 -2 又去查时序或 NVIC。这一处位于 CubeMX 生成区，图形界面重新生成时会自动带上。
+- 验证：37 个源文件按 EIDE 同款参数重编译，零错误零警告；完整链接通过
+  （RAM 8408B/64KB，FLASH 27464B/512KB）。`nm` 确认 ELF 中存在 `MX_CAN_Init`。
+  重新生成 `build/Debug/host_computer_ZET6_CAN_loopback.bin`：27464B，crc32=0x5A6D4D36。
+- 仍需上板确认：预期日志为 `[can] init OK, 500000 bps, sample 88.8%, loopback`
+  与 `[can] loopback self-test PASS (tx=1 ovf=0 err=0 bof=0)`。
+- 另外：同一份日志里的 `W25Q 芯片ID=0x000000`、两个槽全 0、参数页丢失，属于 SPI2/W25Q
+  那条链路的独立问题，不影响 CAN 回环，**本轮不动**。
+
+## 2026-11-25 10:24 — ZET6 CAN 回环自测实机 PASS（验证记录，无代码改动）
+
+### 问题（如有）
+
+确认补上 `MX_CAN_Init()` 后的 bin（27464B / crc32 0x5A6D4D36）在 ZET6 板上实机通过，
+为后续 ZET6 ↔ C8T6 的真实 CAN 通信建立可信基线。
+
+### 改动
+
+- 无代码改动，仅记录实机日志：
+  `[can] init OK, 500000 bps, sample 88.8%, loopback`
+  `[can] loopback self-test PASS (tx=1 ovf=0 err=0 bof=0)`
+- 结论：ZET6 侧 CAN 内核的位时序、过滤器放行、RX0 中断、回调、收帧队列整条路径已通；
+  与 C8T6/APP 阶段 1a 的验收标准一致。
+- 仍未覆盖：PB8/PB9 引脚复用、外部收发器、120Ω 终端、对端 ACK、真实总线上的
+  过滤器拒收行为——这些要接上 C8T6 后另测。
+- 同一份日志里 W25Q ID=0x000000 / 槽全 0 / 参数页丢失仍是 SPI2/W25Q 的独立问题，
+  本轮未处理，也不影响上述 CAN 结论。
+
+## 2026-11-25 10:38 — ZET6 板载 Flash 改接 SPI1(PA4~PA7)
+
+### 问题（如有）
+
+用户把野火 `STM32F103ZET6 核心板双 USB 款` 资料放进 `参考/`，要求按规格书改外部 Flash 引脚。
+引脚分配表 Sheet1 第 8~11 行原文：`PA4/SPI1_NSS=连接SPI_FLASH的CS引脚`、
+`PA5/SPI1_SCK=连接SPI_FLASH的CLK引脚`、`PA6/SPI1_MISO=连接SPI_FLASH的DO/IO1引脚`、
+`PA7/SPI1_MOSI=连接SPI_FLASH的DI/IO0引脚`。
+工程原来配的是 SPI2 + PB12(CS)/PB13/14/15，与实物不符，所以 JEDEC ID 一直读回 0。
+
+### 改动
+
+- `host_computer_ZET6/host_computer_ZET6.ioc` — IP 列表 `SPI2→SPI1`，引脚定义
+  PB12~PB15 换成 PA4~PA7（PA4 仍是软件片选 `W25Q128_CS`），
+  functionlistsort 改为 `MX_SPI1_Init`；分频 `SPI2/4` 改 `SPI1/8`。
+- `host_computer_ZET6/Core/Src/spi.c` — `hspi2/SPI2→hspi1/SPI1`，句柄实例改 `SPI1`，
+  MspInit 时钟改 `__HAL_RCC_SPI1_CLK_ENABLE()`、GPIO 由 GPIOB/PB13~15 改 GPIOA/PA5~7；
+  **分频由 4 改 8**：SPI1 在 APB2(72MHz)、原 SPI2 在 APB1(36MHz)，
+  只有 72/8=36/4=9MHz 才能保持原来的 FLASH 时钟不超频。
+- `Core/Inc/spi.h` — 同步 `extern hspi1` 与 `MX_SPI1_Init()` 原型。
+- `Core/Inc/main.h` — `W25Q128_CS_Pin` 由 `GPIO_PIN_12/GPIOB` 改 `GPIO_PIN_4/GPIOA`。
+- `Core/Src/main.c` — 初始化序列改 `MX_SPI1_Init()`；自检里 `W25q_Init(&hspi1, ...)`；
+  注释里的排查路径同步改为 PA4 / SPI1（PA4=CS、PA5=CLK、PA6=DO、PA7=DI）。
+- `Application/App/Boot_Loader/Boot_Loader.c` — 跳转 App 前 `HAL_SPI_DeInit(&hspi1)`，
+  注释同步；否则 App 重新初始化时仍可能在活着的 SPI 上改配置。
+- `Application/BSP/W25Q/w25q.h` — 文件头/参数注释改成 SPI1 + PA4，并写明板上接线来源；
+  软件片选的理由改成"PA4 同时是 SPI1_NSS，硬件 NSS 会在多字节周期中途释放"。
+- 验证：37 个源文件按 EIDE 参数重编译零错误零警告，链接通过
+  （RAM 8408B/64KB、FLASH 27452B/512KB）；ELF 中有 `MX_SPI1_Init`/`hspi1`/`MX_CAN_Init`/
+  `W25q_Init`。新 bin `build/Debug/host_computer_ZET6_CAN_loopback.bin`：27452B，
+  crc32=0x4CB00D65。**未上板**，待用户回传 W25Q ID 日志。
+- 未改、需确认：该板 FLASH 实装 W25Q64（8MB，JEDEC 应为 0xEF4017），
+  而 `w25q.h` 仍按 W25Q128（16MB）写 `W25Q_SIZE` 与 `W25Q_JEDEC_ID`。
+  本轮只按用户要求改引脚；上板后若读到 0xEF4017，那句"异常，应为 0xEF4018"
+  是期望值没同步，不是接线问题，是否改容量/ID 由用户决定。
+
+## 2026-11-25 10:43 — ZET6 Flash 按 W25Q64 同步容量与 JEDEC ID
+
+### 问题（如有）
+
+上一版改引脚后上板，日志变为 `[boot] W25Q 芯片ID=0xEF4017 异常，应为 0xEF4018`，
+证明 SPI1/PA4~PA7 接线已通；剩余问题只是驱动仍按 W25Q128 写容量和期望 ID。
+用户贴出该日志，按上一轮提出的方案同步为板上实装的 W25Q64。
+
+### 改动
+
+- 边界核对：OTA 布局最高只到 `0x101000`（确认标记 `0x100000` + 日志扇区），
+  双槽在 `0x000000~0x0FFFFF`，全部落在 8MB 内，缩小 `W25Q_SIZE` 不影响现有布局。
+- `Application/BSP/W25Q/w25q.h` — `W25Q_SIZE` 由 16MB 改 8MB、`W25Q_JEDEC_ID` 由
+  `0xEF4018` 改 `0xEF4017`；文件头与 `W25q_ReadId` 注释同步；补充"布局只用 1MB"的依据。
+- `Application/BSP/W25Q/w25q.c` — 文件头 `W25Q128` 改 `W25Q64`。
+- `Core/Src/main.c` — 自检日志的期望值不再写死字面量，改为从 `W25Q_JEDEC_ID` 打印：
+  `[boot] W25Q 芯片ID=0x%06lX %s，应为 0x%06lX`；注释里的判定值同步为 0xEF4017。
+  这样以后换器件只改驱动头文件，日志不会继续报一个作废的 ID。
+- `Application/BSP/OTA/ota_slot.h` — 三处注释里的 W25Q128/16MB/15MB 改成
+  W25Q64/8MB/7MB（纯注释，布局常量没动）。
+- 验证：37 个源文件按 EIDE 参数重编译零错误零警告，链接通过（RAM 8408B、
+  FLASH 27452B）；新 bin `build/Debug/host_computer_ZET6_CAN_loopback.bin`：
+  27452B，crc32=0x12C88CC6。**未上板**，待用户确认日志显示 `正常` 且槽/参数页行为符合预期。
+- 注意：槽里之前留下的乱码头部是旧固件/未擦除 Flash 的残留，与本次容量改动无关；
+  是否擦除重来由用户决定，本轮没有动任何 Flash 内容。
+
+## 2026-11-25 10:58 — ZET6 删除跳 App，串口数据改存外部 Flash 槽 A
+
+### 问题（如有）
+
+用户明确不再需要跳 App，新目标是「串口接收 → 写外部 Flash → 需要时经 CAN 发出」。
+经确认，本轮范围：① 连跳转配套逻辑一起删；② 数据写槽 A、从数据区起点开始、
+保留尾部记录 + CRC；③ CAN 发送本轮先不做。
+原流程里串口数据经 `Ota_Feed()` → `Ota_PushPage()` 写的是**片内 App 区**
+（`APP_ADDR=0x08008000`），跳转只是上电窗口的出口；两者都必须改。
+
+### 改动
+
+- `host_computer_ZET6/Core/Src/main.c` — 整体重写用户区：
+  - 删除上电 3 秒窗口、`Boot_Loader_JumpToApp()` 调用、`CheckAppBoot()`、`TrialGuard()`、
+    `Bkp_Init/MarkJump/JumpUnacked` 与 BKP 魔术字、参数页读写与试用状态相关调用、
+    `OtaApply_FromSlot/RecoverParam/RestoreFromB` 调用；`ResetCause_Name()` 也随之删除
+    （只保留复位原因快照与打印、黑匣子记录）。
+  - `FinishOta()` 改为：Flush → 长度比对 → `OtaSlot_BuildHeader()` →
+    `OtaSlot_VerifyData()` 读回校验 → `OtaSlot_WriteHeader(OTA_SLOT_A)`。
+    不再校验/写片内 Flash，不再存参数页，不再跳转。头部最后写。
+  - `HandleRx()` 越界判断从 `OTA_APP_MAX`（片内）改为 `OTA_SLOT_DATA_MAX`（508KB）。
+  - 新增 `s_ota_started`：本次上电第一包数据到达时才 `OtaSlot_EraseHeader(OTA_SLOT_A)`
+    并重设 `Ota_Init(OtaSlot_DataAddr(OTA_SLOT_A))`；没有新数据时，
+    上次保存好的槽 A 内容不会被开机动作破坏，便于后续经 CAN 发出。
+  - 就绪日志改为 `[recv] 就绪，外部 Flash 槽A 数据起点=0x%08lX，容量=%luB，协议=2`。
+- `Application/BSP/OTA/ota_app.h` / `ota_app.c` — 落盘后端从片内 Flash 换成 W25Q：
+  `Ota_PushPage()` 改用 `W25q_EraseSector()` + `W25q_Write()`；`OTA_PAGE_BYTES`
+  由 2048（片内页）改为 4096（外部扇区），攒页缓冲 4KB；
+  `Ota_Init()` 注释改为传 `OtaSlot_DataAddr(OTA_SLOT_A)=0x001000`。
+  仍保留 256B 编程页由 `W25q_Write()` 自动切分。
+- `Application/App/Boot_Loader/Boot_Loader.c` / `.h` — 删除 `Boot_Loader_AppValid()`
+  与 `Boot_Loader_JumpToApp()` 及相应 include；只保留 `Boot_Loader_Getlen()`。
+- 保留：CAN 回环自测、W25Q ID 自检、槽状态只读打印、OTA 黑匣子、12 字节尾部记录解析
+  （`Ota_ParseTail` 仍在 `ota_param.c`，参数页函数虽保留在源文件但已无调用者，
+  链接时被 `--gc-sections` 剔除）。
+- 验证：37 个源文件按 EIDE 参数编译零错误零警告；完整链接通过
+  （RAM 8376B/64KB = 12.78%，FLASH 20940B/512KB = 3.99%，比改前少 6512B）。
+  `nm` 确认 `Boot_Loader_JumpToApp` / `Boot_Loader_AppValid` / `OtaApply_FromSlot` /
+  `Ota_Param_Load` / `Ota_Param_Save` 均已不在 ELF 中，
+  `OtaSlot_WriteHeader` / `OtaSlot_VerifyData` / `W25q_Write` / `W25q_EraseSector` 在。
+  新 bin `build/Debug/host_computer_ZET6_CAN_loopback.bin`：20940B，crc32=0xF002D6C5。
+  **未上板**，待用户验证串口收数据后槽 A 头部显示正常、长度/CRC 与尾部一致。
+- 边界：单包数据上限 508KB；要写出可发送的槽头必须让上位机补发 12 字节尾部记录，
+  只靠 2 秒 idle flush 写出的内容不会生成有效头部（数据本身仍在 Flash 里）。
+- 下一步（本轮未做）：经 CAN 把槽 A 内容发出，含分帧、块级 ACK 与触发方式。
+
+## 2026-11-25 11:20 — 上板验证：删除跳转 + 落盘改外部 Flash 槽 A 通过
+
+### 验证结果
+
+烧 `build/Debug/host_computer_ZET6_CAN_loopback.bin`（20940B / crc32 0xF002D6C5）到
+0x08000000 后，串口输出：
+
+```
+[can] init OK, 500000 bps, sample 88.8%, loopback
+[can] loopback self-test PASS (tx=1 ovf=0 err=0 bof=0)
+[rst] PIN  / 复位引脚
+[rst] SFT  / 软件复位
+[boot] W25Q 芯片ID=0xEF4017 正常，应为 0xEF4017
+[recv] 就绪，外部 Flash 槽A 数据起点=0x00001000，容量=520192B，协议=2
+```
+
+- CAN 回环在重写 main 之后仍 PASS，说明拆跳转链路没有波及 CAN 初始化顺序。
+- `[boot] App 无效：向量表不对` 与 `[boot] 没有可用 App，等待串口下载` 两行已消失，
+  说明 `Boot_Loader_JumpToApp()` / 有效性检查确实从执行路径上移除了，不只是符号被 gc 掉。
+- 就绪行从 `[ota] 就绪，App=0x08008000` 变成 `[recv] 就绪，外部 Flash 槽A …`，
+  起点 0x001000、容量 520192B（508KB）与 `OTA_SLOT_DATA_MAX` 一致，落盘目标已切到外部 Flash。
+- 本轮**没有**串口数据下发，因此槽 A 头未被擦除，`[slot] A/B 不可信` 与那 32 字节乱码
+  仍是旧固件/未擦除 Flash 的残留——符合"第一包数据到达才擦头"的设计，不是回归。
+- 黑匣子里的 `#6/#8 无可用App` 是旧固件时代写入的历史条目，不是本次启动记录。
+
+### 改动
+
+- 无（仅验证与记录）。
+
+### 待办
+
+- 下一轮：经 CAN 分帧发送槽 A 内容，触发方式与块级 ACK 流控待定。
+
+## 2026-11-25 17:30 — 删除开机日志的 [rst] 与 [slot] 两块打印
+
+### 问题（如有）
+
+用户要求去掉开机日志里两段输出：`[rst] PIN / 复位引脚`、`[rst] SFT / 软件复位` 这类复位原因行，
+以及 `[slot] A/B：不可信…` 连同 32 字节十六进制转储。经确认是**两块都去掉**。
+
+### 改动
+
+- `host_computer_ZET6/Core/Src/main.c::PrintResetCause` — 整个函数（含文档注释）删除，
+  `main()` 里 `PrintResetCause();` 调用行一并删除。
+  **只删打印，不动 `ResetCause_Snapshot()`**：`s_rst_cause` 仍要给后面的黑匣子
+  `OtaLog_Append()` 记录"这次是怎么起来的"用，删掉快照会让黑匣子只剩 `RST_OTHER`。
+  `-Os` 下该静态函数被内联进 `main`（`nm`/`.map` 里查不到符号属正常，不是被误删），
+  反汇编确认 `main` 仍在读 `RCC->CSR`(0x40021000+0x24) 并写 `s_rst_cause`。
+- `host_computer_ZET6/Core/Src/main.c::main` — 「槽状态只读打印」整块删除
+  （遍历 A/B 两槽的 `[slot]` 行与十六进制转储共约 45 行）。槽头部读写函数本身没动，
+  `FinishOta()` 里的 `OtaSlot_BuildHeader/VerifyData/WriteHeader` 照旧；
+  `OtaSlot_ReadHeader()` 因此失去唯一调用者，被 `--gc-sections` 剔除（源码保留）。
+- 副作用：开机日志变短，`[slot]` 只剩收尾时的 `[ota] 槽 A 已保存：%luB CRC=0x…` 一处可看槽内容；
+  复位原因只能从黑匣子 `[log] #N 复位键/…` 反查，串口不再直接说"为什么被复位"。
+- 验证：37 个源文件按 EIDE 参数编译零错误零警告；链接通过
+  （RAM 8376B/64KB = 12.78%，FLASH 20128B/512KB = 3.84%，比改前 20940B 少 812B）。
+  `nm` 确认 `PrintResetCause`、`OtaSlot_ReadHeader` 已不在 ELF，
+  `OtaSlot_WriteHeader/VerifyData`、`OtaLog_Append`、`Ota_Flush`、`W25q_Write`、
+  `CanDrv_SelfTest`、`MX_CAN_Init` 仍在。
+  新 bin `build/Debug/host_computer_ZET6_CAN_loopback.bin`：20128B，crc32=0x826014FA。**未上板**。
+- 注意：黑匣子 `[log] #5~#9` 里的「复位键 / 无可用App」是 Flash 里早已写下的历史条目，
+  不是本次打印，也不是本次启动产生的；要它们消失得清日志扇区或忽略，与本次改动无关。
+
+## 2026-11-25 17:36 — 删掉黑匣子倒出与复位记录
+
+### 问题（如有）
+
+用户要求把开机的 `[log] 最近 N 条` 那几行也删掉，并且"直接不记录复位记录了"。
+
+### 改动
+
+- `host_computer_ZET6/Core/Src/main.c::main` — 删除 `OtaLog_DumpRecent(5U)` 调用
+  及紧随其后的"追加本次复位事件"块（`ev` 判定 + `OtaLog_Append`）。开机不再有 `[log]` 任何输出。
+- `host_computer_ZET6/Core/Src/main.c` — 复位原因快照随之成为死代码，一并删除：
+  `RST_CAUSE_POR/PIN/SFT/IWDG/WWDG/LPWR` 六个宏、`static uint8_t s_rst_cause`、
+  `ResetCause_Snapshot()` 函数体、`main()` 里 `USER CODE BEGIN Init` 段的调用。
+  这些代码的唯一消费者就是刚删掉的那段黑匣子记录和更早已删的 `PrintResetCause()`，
+  留着会变成 `-Os` 下的未使用警告。
+  副作用：`RCC->CSR` 的复位标志不再被清除、也无人读取——对运行无影响（标志只是累积原地）。
+- `host_computer_ZET6/Core/Src/main.c` — `#include "ota_log.h"` 的行尾注释同步，
+  说明现在只剩接收循环那条 `OTA_MODE` 事件。
+- **保留** `OtaLog_Append(OTA_LOG_EVT_OTA_MODE, …)`（接收循环里，开始新传输时记一笔）：
+  用户只要求不记复位，这条没动。代价是它仍会在每次新传输开始时写一次外部 Flash 日志扇区，
+  但已没有任何地方打印——是否一并去掉待用户决定。
+- 验证：37 个源文件按 EIDE 参数编译零错误零警告；链接通过
+  （RAM 8376B/64KB = 12.78%，FLASH 19468B/512KB = 3.71%，比改前 20128B 少 660B）。
+  `nm` 确认 `OtaLog_DumpRecent`、`OtaLog_Count`、`PrintResetCause` 已不在 ELF，
+  `OtaLog_Append`、`OtaSlot_WriteHeader/VerifyData`、`Ota_Flush`、`W25q_Write`、
+  `CanDrv_SelfTest`、`MX_CAN_Init` 仍在。
+  新 bin `build/Debug/host_computer_ZET6_CAN_loopback.bin`：19468B，crc32=0x677163BD。**未上板**。
+- 注意：Flash 日志扇区（0x101000）里已有的历史条目不会被删除，只是不再打印；
+  槽 A/B 头部里的旧乱码同理，与本轮无关。
+
+## 2026-11-25 17:46 — ZET6 侧 CAN 由回环改为 Normal，周期发送测试帧
+
+### 问题（如有）
+
+用户 ZET6 一侧的 CAN 物理端（CAN_H/CAN_L、收发器）已接好，要求把原来的
+`CAN_MODE_LOOPBACK` 自测改成真正把数据发到总线上。经确认本轮范围：
+**只改 ZET6，发送内容为周期测试帧**（先验物理层，槽 A 的 OTA 数据分帧留到下一步；
+C8T6 侧本次不动）。
+
+### 改动
+
+- `host_computer_ZET6/host_computer_ZET6.ioc::CAN.Mode` — `CAN_MODE_LOOPBACK` → `CAN_MODE_NORMAL`。
+  位时序（PSC=4/BS1=15TQ/BS2=2TQ）、NART/ABOM/RFLM 均未动，仍是 500kbps / 88.9%。
+- `host_computer_ZET6/Core/Src/can.c::MX_CAN_Init` — `hcan.Init.Mode` 同步改为
+  `CAN_MODE_NORMAL`，并注明必须与 .ioc 保持一致，否则 CubeMX 重新生成会把 LOOPBACK 写回来。
+- `host_computer_ZET6/Application/BSP/CAN/can_drv.c` — 新增 `static volatile uint32_t s_last_err`：
+  在 `HAL_CAN_ErrorCallback()` 清零 `ErrorCode` **之前**存档一份错误位掩码
+  （HAL 约定不清零就不会再回调，清完上层就看不到错在哪）；`CanDrv_Init()` 里一并清零。
+- `host_computer_ZET6/Application/BSP/CAN/can_drv.c::CanDrv_BusDiagnostics` — 新增：
+  只读 `CAN->ESR` 取出 TEC/REC，并输出最近一次错误位掩码，传 NULL 表示不需要该项。
+  目的：区分「帧没出引脚」（TEC 恒 0）和「帧在总线上但没人 ACK」（TEC 持续增长）。
+- `host_computer_ZET6/Application/BSP/CAN/can_drv.h` — 补充上面这个接口的声明与用法说明。
+  `CanDrv_SelfTest()` 未改，Normal 下仍返回 -2（main 不再在该模式下调用它）。
+- `host_computer_ZET6/Core/Src/main.c` — 新增两个宏：`CAN_TEST_TX_PERIOD_MS`(1000)、
+  `CAN_TEST_TX_TIMEOUT_MS`(20)；开机 CAN 段的 Normal 分支改为打印
+  `[can] normal mode: 每 1000ms 发送一帧 id=0x601，等对端 ACK`（回环分支与自测原样保留）。
+- `host_computer_ZET6/Core/Src/main.c::main` — 主循环尾部新增周期发送块：
+  仅 Normal 模式执行，8 字节帧 `A5 5A | 序号(小端 4B) | 01 | 00`，StdId = `CANDRV_ID_REQ`(0x601)。
+  成功打印 `[can] tx #N OK, 累计 tx/err/bof`，失败打印
+  `[can] tx #N FAIL code err tec rec`。`can_tx_tick` 初始回退一个周期，使第一帧立刻发出。
+- 副作用/注意：
+  1. Normal 模式下 `AutoRetransmission=ENABLE`，对端不回 ACK 时帧会被无限重传、邮箱不空，
+     `CanDrv_Send` 走 20ms 超时返回 -4；三个邮箱都被占满后返回 -3。**这是没有应答，不是故障。**
+  2. 发送失败时每秒一行日志、每帧最多阻塞 20ms，相对 1 秒周期不影响串口接收落盘。
+  3. **C8T6 侧本轮未改**，仍在 LOOPBACK 且 `CAN_STB`(PB7) 置高（收发器待机），
+     既不参与总线也不回 ACK —— 因此单独烧这块固件时预期全部 tx FAIL（tec 递增）。
+     要看到 `tx OK`，总线上必须有一个 Normal 模式且在接收的对端。
+- 验证：38 个源文件按 EIDE `compile_commands.json` 参数编译，**零错误零警告**；链接通过
+  （RAM 8376B/64KB = 12.78%，FLASH 19872B/512KB = 3.79%，比改前 19468B 多 404B）。
+  `nm` 确认 `CanDrv_BusDiagnostics` / `CanDrv_Send` / `CanDrv_SelfTest` / `MX_CAN_Init` 均在 ELF。
+  新 bin `build/Debug/host_computer_ZET6_CAN_tx.bin`：19872B，crc32=0x798BABD9。**未上板**。
+- 下一步（本轮未做）：C8T6 侧改 Normal + 拉低 STB 形成闭环；槽 A 数据经 CAN 分帧发送。
+
+## 2026-11-25 17:59 — C8T6 侧改 Normal + 拉低 STB，主循环接收并打印 0x601
+
+### 问题（如有）
+
+ZET6 侧 1b 上板后串口持续输出
+`[can] tx #N FAIL code=-4/-3 err=0x00000002 tec=128 rec=0`：
+TEC 顶到 128（Error Passive 阈值，等于 16 次无 ACK），err=0x02 是 `HAL_CAN_ERROR_EPV`。
+说明帧在发、没人应答。C8T6 收不到有三道闸：仍在 LOOPBACK（F103 回环模式**断开 RX 引脚**）、
+`CAN_STB`(PB7) 置高使收发器 Standby、`main.c` 里根本没有读接收队列的代码。
+用户确认后本轮只做「C8T6 接收」，不改发送逻辑、不做应答。
+
+### 改动
+
+- `APP/APP.ioc::CAN.Mode` — `CAN_MODE_LOOPBACK` → `CAN_MODE_NORMAL`。
+- `APP/APP.ioc::PB7.PinState` — `GPIO_PIN_SET` → `GPIO_PIN_RESET`。
+  改在 .ioc 里而不是只改 gpio.c，是为了让 CubeMX 重新生成时也保持低电平。
+- `APP/Core/Src/can.c::MX_CAN_Init` — `hcan.Init.Mode` 同步改 `CAN_MODE_NORMAL`，
+  注明与 .ioc 的对应关系。位时序未动（500kbps / 88.9%，与 ZET6 一致）。
+- `APP/Core/Src/gpio.c::MX_GPIO_Init` — 把 `CAN_STB_Pin` 从
+  `HAL_GPIO_WritePin(GPIOB, W25Q_CS_Pin|LED2_Pin|CAN_STB_Pin, GPIO_PIN_SET)`
+  这一组里拆出来，单独 `HAL_GPIO_WritePin(CAN_STB_GPIO_Port, CAN_STB_Pin, GPIO_PIN_RESET)`。
+  写法与 .ioc 改后的生成结果一致，避免下次 regen 出现无意义 diff。
+- `APP/Core/Src/main.c` — CAN 初始化段的大注释改写为 1b 现状（说明回环为什么收不到、
+  两道闸分别在哪）；Normal 分支的打印从 `self-test skipped` 改为
+  `[can] normal mode: 接收就绪，等待上位机 0x601`。回环分支与 `CanDrv_SelfTest()` 调用原样保留。
+- `APP/Core/Src/main.c::main` — 主循环末尾新增接收轮询：`while (CanDrv_RxPop(&f) == CANDRV_OK)`
+  逐帧打印 `[can] rx id=0x%03lX dlc=%u data=...`（固定 8 字节）。只打印、不回帧。
+- 副作用/注意：
+  1. 收发器从上电起常通，比待机多几 mA，这是接收必须的代价。
+  2. 每帧日志约 80 字节，115200 下约 7ms；对 `Boot_Loader_Getlen()` 的轮询节奏影响可忽略。
+  3. 接收队列深度只有 8，必须在主循环每圈取干净；被 Flash 擦写阻塞过久会导致 ovf 计数上涨。
+  4. 本侧过滤器认 `CANDRV_ID_REQ`(0x601)，正好是 ZET6 发的测试帧；不做应用层应答，
+     总线 ACK 由 CAN 控制器硬件完成，所以 ZET6 会直接看到 tx OK。
+- 验证：36 个源文件按 EIDE `compile_commands.json` 参数编译，**零错误零警告**；链接通过
+  （RAM 8632B，text 20704 + data 92 = FLASH 20796B，比改前 20628B 多 168B）。
+  `.isr_vector` VMA = 0x08005000，烧录地址不变；`nm` 确认 `CanDrv_RxPop` / `CanDrv_Init` 在 ELF。
+  新 bin `APP/build/Debug/APP_can_rx.bin`：20796B，crc32=0x9E4633D8。**未上板**。
+- 下一步（本轮未做）：槽 A 数据经 CAN 分帧发送；C8T6 侧对 0x601 做应用层应答（0x581）。
+
+## 2026-11-25 18:07 — C8T6 加 CAN 状态心跳（物理层排查，临时）
+
+### 问题（如有）
+
+两侧 Normal 都已跑起来（ZET6 `tx #266 FAIL tec=152`、C8T6 `[can] init OK ... normal`
+但一帧未收），软件层已无从下手：只打印"收到了什么"无法区分
+「总线上没有电平活动」和「有活动但解不出帧」，而这两者指向完全相反的硬件排查方向。
+故在接收方加 ESR 诊断，用 REC 判断它到底有没有"听到"总线。
+
+### 改动
+
+- `APP/Application/BSP/CAN/can_drv.c` — 加 `static volatile uint32_t s_last_err`，
+  在 `HAL_CAN_ErrorCallback()` 清零 `ErrorCode` 前存档；`CanDrv_Init()` 里清零；
+  新增 `CanDrv_BusDiagnostics(tec, rec, last_err)` 读 `CAN->ESR`（与 ZET6 侧同实现）。
+- `APP/Application/BSP/CAN/can_drv.h` — 声明 `CanDrv_BusDiagnostics()` 并写明接收方判据。
+- `APP/Core/Src/main.c` — `can_rx_cnt` 在接收循环里累加；主循环新增 5 秒一次的心跳
+  `[can] stat: rx= ovf= err= bof= tec= rec= lasterr=`，注释里给出四种读数各自对应的结论。
+  **这是临时诊断代码**，定位完成后连同 `CanDrv_BusDiagnostics` 一起删除。
+- 副作用：每 5 秒多一行约 80 字节日志（115200 下约 7ms），不影响串口收 bin；
+  读 ESR 是只读操作，不改任何状态。
+- 验证：36 个源文件零错误零警告；链接通过（RAM 8640B，FLASH 21040B，比上一版多 244B）。
+  新 bin `APP/build/Debug/APP_can_rx.bin`：21040B，crc32=0x99600A17。**未上板**。
+- 判据（下一轮按此分流）：
+  `rec` 恒 0 → 线断 / 收发器 Standby / 不共地 / CAN_H、CAN_L 接反；
+  `rec` 递增 → 听到位流但解不出帧 → 波特率、采样点或极性；可试降到 125k（Prescaler=16）。
+
+## 2026-11-25 18:15 — 串口助手 SWD 复位可选目标（多调试器/多板子）
+
+### 问题（如有）
+
+电脑上同时插两块板（各带一个调试器）、开两个串口助手实例时，两个实例的
+SWD 复位都只作用于同一块板，另一块完全没反应。根因：探测只取第一个匹配的
+调试器，OpenOCD 命令里也没有 `adapter serial`，所以谁都没有"指定哪一块"的能力。
+
+### 改动
+
+- `Tools/SerialAssist/serial_assist.py::detect_debuggers` — 新增。枚举**全部**
+  在位调试器，返回 `{iface, name, serial, vidpid, prio}` 列表。序列号取 Windows
+  devnode id 末段（`USB\VID_0483&PID_374B\AE5A...`）；带 `&MI_` 的复合设备接口
+  节点必须跳过，其末段是总线拓扑编号（`8&12225435&0&0000`），同型号会重名、
+  重插还会变。按 `DEBUGGERS` 表顺序排序，保证"第一个"与旧行为一致。
+- `Tools/SerialAssist/serial_assist.py::detect_debugger` — 改为调 `detect_debuggers()`
+  取第一个，签名与行为保持不变（`--check` 等旧调用不受影响）。
+- `Tools/SerialAssist/serial_assist.py::openocd_reset` — 新增 `serial=""` 参数；
+  非空时在 `-f interface/*.cfg` 之后、`init` 之前插入 `-c "adapter serial <sn>"`。
+  顺序不能提前，否则 adapter driver 还没注册会报 unknown command。
+- `Tools/SerialAssist/serial_assist.py::_probe_debugger` — 改为枚举全部设备并存
+  `self.ocd_debuggers` / `self.ocd_serial`；新增 `self.ocd_serial_missing`。
+  计算 iface 的优先级变为：手写 `ocd_iface` > 选中设备类型 > 第一个设备 > 猜。
+- `Tools/SerialAssist/serial_assist.py::_refresh_debugger_ready` — 新增，从
+  `_probe_debugger` 抽出的 iface 脚本存在性/就绪计算，切换目标时单独调用。
+- `Tools/SerialAssist/serial_assist.py::_apply_debugger_ui` — 增加下拉框同步；
+  新增三种异常提示：锁定的调试器不在位、手写 `ocd_iface` 与设备类型不符、多台在位。
+- `Tools/SerialAssist/serial_assist.py::_current_debugger` / `_dbg_labels` /
+  `_sync_debugger_combo` — 新增，下拉框与序列号的映射与反查。
+- `Tools/SerialAssist/serial_assist.py::_on_pick_debugger` — 新增。选完立刻
+  `save_config` 落盘并切 iface。**同时更新内存 `self.cfg`**：`_probe_debugger`
+  从 `self.cfg` 读 `ocd_serial`，只写磁盘会导致"刷新软件"把刚选的目标覆盖回去
+  （验证时实测踩到，已修）。
+- `Tools/SerialAssist/serial_assist.py::_rescan_debuggers` — 新增，绑定在
+  `cb_dbg` 的 `<Button-1>`：点开下拉前重扫 USB，只更新设备列表，不动串口/日志。
+- `Tools/SerialAssist/serial_assist.py::_build_fw_card` — 新增「复位目标」下拉
+  （row 8），调试器状态提示行从 row 8 让到 row 9。
+- `Tools/SerialAssist/serial_assist.py` 三处 `openocd_reset` 调用（手动复位、
+  发送前复位、发完复位）统一传 `serial=self.ocd_serial`。
+- `Tools/SerialAssist/serial_assist.py::on_close` — **修历史 bug**：原来是整份
+  字典覆盖写，`ocd_iface` / `ocd_target` 这些不由界面维护的键会在关窗时被静默
+  丢掉（"手写配置自己就没了"）。改为 `load_config()` 后 `update()` 再写。
+- `Tools/SerialAssist/serial_assist.py::main`（`--check`）— 多打印两行：
+  全部在位调试器清单与当前复位目标，打包后不接 GUI 也能核对。
+- 副作用/注意：
+  1. 锁定的调试器被拔掉时，按钮仍可点，但会报 `unable to find a matching
+     CMSIS-DAP device` / `open failed` —— 有意不静默换成另一块板，避免复位错目标。
+  2. 两个实例共用一份 `assist_config.json`，`ocd_serial` 也是共用的；运行期间
+     各按内存里的选择走，重启后读到的是最后写入的那个。
+  3. 不同设备类型必须用各自的 iface 脚本；若在 json 里手写了 `ocd_iface` 且与
+     所选设备不符，提示行会红字警告（复位会失败）。
+- 验证：
+  1. 本机实测枚举到 2 台：`DAP-Link@3e5441d77b0dad97`、
+     `ST-Link V2-1@AE5A5BB50000000000078851`，无 MI 伪串、无重复。
+  2. 假序列号实测：DAP-Link 报 `unable to find a matching CMSIS-DAP device`、
+     ST-Link 报 `open failed`，证明 `adapter serial` 确实在过滤。
+  3. 真序列号实测（`init; shutdown`，不复位）：DAP-Link 侧
+     `CMSIS-DAP: FW Version = 2.0.0`；ST-Link 侧 `STLINK V2J48M35 (API v2)
+     VID:PID 0483:374B`。两个序列号各自锁定到不同调试器。
+  4. 界面模拟两台设备：下拉三项、选 ST-Link 后 `ocd_name/ocd_iface/ocd_serial`
+     同步切换、内存与磁盘配置一致；拔掉锁定的那台 → `ocd_serial_missing=True`
+     且红字提示；插回 → 恢复；切回自动 → 清空序列号。
+  5. `on_close` 测试：预先塞入 `ocd_target` 和自定义键，关窗后仍在（修复前会丢）。
+  6. 源码 `py_compile` 与 `--check` 通过（9 个串口、2 台调试器）；
+     exe 重新打包 18:14 并自检通过，`debuggers(2)` 两台都认到。
+- 测试写入的 `ocd_serial` / `ocd_target` / 自定义键已从两份配置
+  （`Tools/SerialAssist/assist_config.json`、`dist/assist_config.json`）中清除。
+
+## 2026-11-25 19:33 — C8T6 诊断版：过滤器放宽成全通过 + 打印 LEC/FMP
+
+### 问题
+
+实机联调仍不通。C8T6 侧 stat 全 0（`rx=0 ovf=0 err=0 tec=0 rec=0`），ZET6 侧
+`tec` 涨到 160、`code=-3`（三邮箱全堵）。但 `rec=0` 有两种完全不同的成因，只看计数器分不开：
+
+1. 总线上真的没有差分跳变（发送端未驱动 / 线不通 / 共模超范围）；
+2. **帧好好到了，但 ID 不匹配被硬件过滤器静默丢弃** —— CAN 的验收过滤器不匹配时
+   直接丢弃且不报任何错，`REC` / `err` / `rx` 三个计数器全是 0，与「没信号」完全同形。
+
+二者要修的东西天差地别（一个查线，一个查过滤器/ID），所以必须加一个能证伪的手段。
+
+另外上一轮的判断也需要修正：上一版日志 `err=1` 而 `rec=255`，32 次以上接收错误只换了
+1 次错误中断，说明那些错误集中在极短瞬间（更像上电瞬态），不是「每秒跟着 ZET6 一帧」
+持续失败；且 `REC` 不会被软件清零、只有成功接收才 -1，所以 255 一直挂着是正常的「化石值」，
+不能据此断言「位流到过 C8T6」。
+
+### 改动
+
+- `APP/Application/BSP/CAN/can_drv.h` — 新增开关 `CANDRV_DIAG_ACCEPT_ALL`（当前 =1）。
+  置 1 时验收过滤器放宽成全通过（ID/掩码全 0），用来把「被过滤器丢掉」从「没信号」里摘出来。
+  副作用：调试期间任意 ID 的帧都会进队列，定位完必须改回 0。只影响过滤器，
+  不碰位时序/模式/中断，不引入新变量。
+- `APP/Application/BSP/CAN/can_drv.c::CanDrv_Init` — 过滤器 ID/掩码赋值按开关分两路，
+  其余（FilterBank/Mode/Scale/FIFO 分配/激活）不变。
+- `APP/Application/BSP/CAN/can_drv.c::CanDrv_BusDiagnostics` — 签名扩为
+  `(tec, rec, lec, fmp, last_err)`，新增两项只读读数：
+  - `lec` = `ESR[6:4]`，最后一次错误类型。1=填充错(位时序) 2=格式错(极性) 3=ACK错(仅发送侧)
+    4/5=位错 6=CRC错(噪声/终端)，0/7=无错。注意它会保持上一次的值直到软件写 111。
+  - `fmp` = `RF0R[1:0]`，RX FIFO0 待读帧数。持续 >0 = 帧进了 FIFO 但中断没取走（中断路径问题）。
+- `APP/Core/Src/main.c` — stat 打印新增 `lec=%u(名字)` 与 `fmp=%u`，LEC 数值直接翻成短名，
+  日志里不用再对照手册；同时更新上方「只放行 0x601」的注释，说明当前处于全通过诊断模式。
+
+### 验证
+
+- APP 工程 36 个文件编译，零错误零警告；链接通过。
+- FLASH 21212B（text 21120 + data 92）/ RAM 8548B；`.isr_vector` 仍在 `0x08005000`，烧录地址不变。
+- 产物 `APP/build/Debug/APP_can_diag.bin`，21212B，crc32 `0x646C53F4`。**未上板。**
+
+### 注意事项
+
+- 这是临时诊断版本，定位结束后要同时做两件事：`CANDRV_DIAG_ACCEPT_ALL` 改回 `0`；
+  删掉 `CanDrv_BusDiagnostics` 与 main 里的 stat 心跳。两者都不清会留下永久性的调试开销。
+- `lec` 一旦非 0 会一直保持，**不能**用它判断「现在还在不在出错」；判断是否仍在出错要看
+  `rec` / `err` 有没有继续增长。
+
+## 2026-11-25 20:03 — 两侧 CAN 降速 500k→125k + 打印 BTR/MCR/PCLK1 实况
+
+### 问题
+
+CAN 物理层联调至今不通，现象是三方证据互相矛盾地"都正常但就是不通"：
+
+- ZET6：`tx #N FAIL code=-3 err=0x02 tec=128~160 rec=0`，即帧在发、永远拿不到 ACK；
+- C8T6：`rx=0 lec=1(stuff) rec=255 fmp=0`，即收到位流但一帧都解不出；
+- 硬件：万用表实测两端 `CANH≈3.0V / CANL≈1.7V`（隐性 2.5/2.5、显性 3.5/1.5 的均值，
+  对应 55~80% 显性占比 → 总线确实在被持续驱动）；C8T6 模块 RXD 对地 1.53V
+  （说明位流已到达 PB8）；断电测两端各 120Ω、接上并联 60Ω（终端齐全）。
+  供电、STB、极性、TX/RX 交叉、过滤器、终端电阻因此全部排除。
+
+剩下两个可能，且方向完全不同，因此本轮用**一次烧录同时验证**：
+
+1. 位时序寄存器是否真的一致 —— 日志里的 "500000 bps / 88.8%" 是拿 `hcan.Init`
+   的**变量值**反算的，不是读寄存器；写入没生效时这行打印看不出来。
+2. 500k 下沿口裕量是否不足 —— 终端正确不代表没有振铃（长分支、非双绞、收发器边沿慢
+   都会让采样点踩在振铃上），其表现正是 stuff error。
+
+### 改动
+
+降速（两侧对称，各 3 处，缺一处 `CanDrv_Init()` 就返回 -6）：
+
+- `APP/APP.ioc` / `host_computer_ZET6/host_computer_ZET6.ioc` — `CAN.Prescaler` 4→16，
+  `CAN.CalculateBaudRate` 500000→125000，`CAN.CalculateTimeBit` 2000→8000，
+  `CAN.CalculateTimeQuantum` 111.11→444.44。改 .ioc 是为了下次 CubeMX 重新生成不回退。
+- `APP/Core/Src/can.c::MX_CAN_Init` / `host_computer_ZET6/Core/Src/can.c::MX_CAN_Init` —
+  `hcan.Init.Prescaler = 16`。BS1/BS2/SJW 不动，仍是 18tq、采样点 88.9%，
+  36MHz/(16×18) = 125kbps。**副作用：OTA 带宽约 11KB/s，20KB 固件约 2 秒，够用。**
+- `APP/Application/BSP/CAN/can_drv.h` / `...ZET6/.../can_drv.h` — `CANDRV_EXPECT_BAUD`
+  500000→125000（该校验基准不写寄存器，但决定 `CanDrv_Init()` 的读回校验是否通过）。
+
+新增寄存器实况打印（只读，不改任何行为）：
+
+- 两侧 `can_drv.h` — 新声明 `void CanDrv_TimingRegs(uint32_t *btr, uint32_t *mcr, uint32_t *pclk1)`。
+- 两侧 `can_drv.c` — 实现该函数：读 `CAN->BTR`（含 bit30=LBKM 回环、bit31=SILM 只听）、
+  `CAN->MCR`（bit0=INRQ 卡在初始化模式）、`HAL_RCC_GetPCLK1Freq()`。
+  三个值必须一起看：BTR 只是分频系数，脱离 PCLK1 算不出波特率。
+  预期（125k/36MHz）：`btr=0x001E0010 mcr=0x00010000 pclk1=36000000`。
+- `APP/Core/Src/main.c` — stat 心跳行尾追加 `btr=0x%08lX mcr=0x%08lX pclk1=%lu`。
+- `host_computer_ZET6/Core/Src/main.c` — init OK 之后补一行 `[can] regs: ...`，
+  与 C8T6 的数值直接对照。
+
+### 验证
+
+- APP：36 文件编译零错误零警告，链接通过；FLASH 21216B + data 92 / RAM 8548B；
+  `.isr_vector` 仍在 `0x08005000`。产物 `APP/build/Debug/APP_can_125k.bin`，
+  21308B，crc32 `0xF7414D71`。
+- ZET6：38 文件编译零错误零警告，链接通过；FLASH 19900B + data 96 / RAM 8280B。
+  产物 `host_computer_ZET6/build/Debug/ZET6_can_125k.bin`，19996B，crc32 `0x78ABC2BC`。
+- **两侧均未上板。**
+
+### 上板判读
+
+- 若 125k 通了（ZET6 出现 `tx #N OK`、C8T6 出现 `[can] rx id=0x601`）→ 原问题是
+  500k 下的信号裕量；可在 125k 上继续 OTA，或后续再逐步提速试 250k。
+- 若 125k 仍报 `lec=1(stuff)` → 与速率无关，看新打印的 `btr`：
+  两侧不一致 = 写入没生效（旧二进制 / MX_CAN_Init 早于时钟配置）；
+  `btr` 的 bit30/bit31 被置位 = 外设实际不在 Normal 模式；
+  `mcr` bit0=1 = 卡在初始化模式。三种都能一眼定性。
+- 收尾必做：定位完成后删 `CanDrv_TimingRegs`、`CanDrv_BusDiagnostics` 与 main 的 stat 心跳，
+  并把 `CANDRV_DIAG_ACCEPT_ALL` 改回 0。
+
+## 2026-11-25 20:22 — 两侧加引脚电平采样（IDR）+ ZET6 补 LEC，12.5k 下仍不通的定位手段
+
+### 问题
+
+125k 联调仍不通，正向与反向接线都试过，均无改善（因此 CAN_H/CAN_L 交叉
+这一假设已被排除）。此时事实清单：
+
+- 位时序层完全对齐：两侧 `btr=0x001E000F`、`pclk1=36000000`，
+  `SystemClock_Config` 逐字相同（HSE 8M×9、APB1 DIV2）；
+- `mcr=0x00010048`，INRQ=0，未卡在初始化模式；
+- 重映射正确：`__HAL_AFIO_REMAP_CAN1_2()` 注释即 `CAN_RX→PB8, CAN_TX→PB9`
+  （HAL 编号反直觉，`CAN1_1` 才是不重映射的 PA11/PA12），
+  `HAL_MspInit` 里已使能 AFIO 时钟，写 MAPR 不会静默失败；
+- 终端 60Ω、供电正常、模块 RXD 有活动（1.53V）；
+- C8T6：`rx=0 rec=255 lec` 在 stuff/crc/form 间轮换；ZET6：`tec` 涨到 218、`rec=0`。
+
+于是只剩一个环节从未被**直接**测过：CAN 控制器的引脚上到底有没有位流。
+此前全靠推理（模块 RXD 有电压 → 以为线通），但模块 RXD 与 MCU 的 PB8
+是两回事，中间那一段断没断从未验证。
+
+附带发现一个此前一直在误导排查的缺陷：`Uart_Printf` 内部是 `char String[100]`，
+超长会被 vsnprintf 静默截断。上一版 stat 行 170+ 字符，`btr` 只打出一半
+（`0x001E00`），导致读数需要靠猜。
+
+### 改动
+
+- 两侧 `Application/BSP/CAN/can_drv.h` — 新增 `void CanDrv_SamplePins(uint32_t samples, uint16_t *lo8_pm, uint16_t *lo9_pm)`。
+- 两侧 `Application/BSP/CAN/can_drv.c::CanDrv_SamplePins` — 在采样窗口内逐次读
+  `GPIOB->IDR`，统计 PB8/PB9 的低电平千分比。原理：引脚交给 CAN 外设后，
+  IDR 读的仍是**引脚本身**的电平（不是 ODR），因此不改引脚模式、不影响收发，
+  就能判断该引脚上有没有跳变。循环体约 6~8 周期，50000 次 ≈ 5ms
+  （8 字节标准帧 @125k 约 1ms，5ms 覆盖多帧，不会正好踩进帧间隙）。
+  `IDR` 声明为 `__IO`，逐圈真读；若缓存到循环外会被优化成只读一次。
+- `host_computer_ZET6/Application/BSP/CAN/can_drv.h/.c::CanDrv_BusDiagnostics` —
+  签名由 `(tec, rec, last_err)` 扩为 `(tec, rec, lec, last_err)`，新增 `lec = ESR[6:4]`。
+  理由：只看 `tec` 涨 + `rec=0` 无法区分「没人应答」和「位流本身坏了」
+  （错误主动阶段的 ACK 错误计入 TEC，两者都会让 TEC 涨），而这两者的修复方向相反。
+- `APP/Core/Src/main.c` — stat 心跳拆成四行（`stat` / `stat2` / `reg` / `pin`），
+  每行都控制在 100 字节内；新增 `CanDrv_SamplePins(50000U, ...)`，输出 `pb8=NNNpm pb9=NNNpm`。
+- `host_computer_ZET6/Core/Src/main.c` — FAIL 分支新增 `lec`、`pb8`、`pb9` 三个字段，
+  并在发送超时后立即采样（此时 ARD 仍开着，总线通常还在重传，5ms 窗口几乎必然落在活动期）。
+
+### 验证
+
+- APP：36 文件零错误零警告，链接通过；FLASH 21428B + data 92 / RAM 8548B；
+  `.isr_vector` 仍在 `0x08005000`。产物 `APP/build/Debug/APP_pinprobe.bin`，21520B，crc32 `0x1C8DE233`。
+- ZET6：38 文件零错误零警告，链接通过；FLASH 20044B + data 96 / RAM 8280B；
+  `.isr_vector` 在 `0x08000000`。产物 `host_computer_ZET6/build/Debug/ZET6_pinprobe.bin`，
+  20140B，crc32 `0xC507C149`。
+- **两侧均未上板。**
+
+### 上板判读（这次是直接测量，不再是推理）
+
+`pm` = 千分比。恒 0 或 1000 表示该引脚在 5ms 内一次都没变过。
+
+| ZET6 pb9 | ZET6 pb8 | C8T6 pb8 | 结论 |
+|---|---|---|---|
+| 有值 | 有值 | 有值 | 两根线上都有真实位流 → 不是连线问题，落在速率/相位/边沿质量，下一步只能示波器或缩短并绞线 |
+| 有值 | 有值 | 0/1000 | C8T6 的 RX 段没通（模块 RXD 到 PB8 之间）→ 查那一段线/焊点 |
+| 有值 | 0/1000 | — | ZET6 收发器回读段断了（PB8 收不到自己发的）→ 板载 U7 到 PB8 的走线或 RXD 输出 |
+| 0/1000 | — | — | 帧连 MCU 引脚都没出 → 控制器/邮箱层面异常，与总线无关 |
+
+配合 `lec`：`3(ack)` 且两根线都有值 = 纯粹缺少应答（对端没解出帧）；
+`1(stuff)/2(form)/6(crc)` = 位流被破坏，按上表继续分流。
+
+### 收尾必做
+
+`CanDrv_SamplePins`、`CanDrv_BusDiagnostics`、main 里的 stat 心跳与
+`CANDRV_DIAG_ACCEPT_ALL` 全是临时诊断设施，定位结束后一并删除 / 改回 0。
+
+## 2026-11-25 20:49 — 删除全部 CAN 诊断设施，只保留接收数据打印
+
+### 问题
+
+物理层排查期间在两侧堆了一批临时诊断（状态心跳、引脚采样、寄存器实况、全通过过滤器）。
+其中一部分结论已经拿到（`btr=0x001E000F` 证明位时序同源、`pb8` 证明引脚状态），
+继续留在树上有两个害处：全通过过滤器会让**总线上任何 ID 的帧都进队列**，
+将来做 OTA 时别人的帧会被当成本机请求；四行 5 秒一次的心跳会持续占用串口带宽。
+因此按用户要求全部删除，只保留"收到就打印"这一条功能。
+
+### 改动
+
+C8T6（`APP/`）：
+
+- `Application/BSP/CAN/can_drv.h` — 删除 `CANDRV_DIAG_ACCEPT_ALL` 开关，以及
+  `CanDrv_BusDiagnostics` / `CanDrv_TimingRegs` / `CanDrv_SamplePins` 三个声明。
+- `Application/BSP/CAN/can_drv.c` — 删除上述三个实现、`s_last_err` 存档变量
+  与其在 `HAL_CAN_ErrorCallback` 里的赋值；过滤器去掉 `#if` 诊断分支，
+  恢复成只放行 `CANDRV_ID_REQ`(0x601) 的精确匹配。
+  ⚠ 副作用：`can_drv.c` 因此回到与上次提交**完全一致**的内容（git status 已不再列出该文件），
+  等于诊断代码从未存在过 —— 这是删除彻底的一个旁证。
+- `Core/Src/main.c` — 删除 `can_rx_cnt` / `s_can_stat_t` 两个变量和整段 5 秒心跳
+  （stat / stat2 / reg / pin 四行 print）。`CanDrv_RxPop` 循环与 `[can] rx ...` 打印保留，
+  这是本阶段唯一需要的输出。
+
+ZET6（`host_computer_ZET6/`）：
+
+- `Application/BSP/CAN/can_drv.h/.c` — 同样删除 `BusDiagnostics`（含 lec）、
+  `TimingRegs`、`SamplePins` 与 `s_last_err`。
+- `Core/Src/main.c` — 删除开机 `[can] regs:` 打印；FAIL 分支退回
+  `"[can] tx #%lu FAIL c=%d err=%lu bof=%lu"`，不再采样引脚与 LEC；
+  OK 分支保持原样（它用的是保留的计数器，属于运行信息而非诊断）。
+
+### 验证
+
+- APP：36 文件零错误零警告，链接通过；FLASH 20700B + data 92 / RAM 8540B；
+  `.isr_vector` 仍在 `0x08005000`。产物 `APP/build/Debug/APP_can_rxonly.bin`，
+  20792B，crc32 `0x0279096D`。
+- ZET6：38 文件零错误零警告，链接通过；FLASH 19672B + data 96 / RAM 8280B。
+  产物 `host_computer_ZET6/build/Debug/ZET6_can_txonly.bin`，19768B，crc32 `0x53552E72`。
+- 用 `nm` 确认两侧 ELF 里 `CanDrv_BusDiagnostics` / `CanDrv_TimingRegs` /
+  `CanDrv_SamplePins` 三个符号**均已不存在**，`CanDrv_RxPop` 与 `HAL_CAN_ErrorCallback` 仍在。
+- **两侧均未上板。**
+
+### 注意事项
+
+- 诊断代码从未提交过 git，删掉后无法用 `git checkout` 找回。若将来又要做物理层定位，
+  按本条与 20:03 / 20:22 两条的说明重建即可（三处读数各有明确的判据）。
+- 上板后若出现"上位机 tx OK 但本侧没有 `[can] rx`"，说明帧到了并被 ACK、但没进队列，
+  问题在验收过滤器或 RX0 中断这一段，与总线物理层无关 —— 那时只需在
+  `HAL_CAN_RxFifo0MsgPendingCallback` 里加一个计数，不必再恢复整套诊断。
+
+## 2026-11-25 21:15 — CAN 波特率 125k → 50k（两侧同步，纯判别试验）
+
+### 问题（如有）
+
+上板后现象：ZET6 侧 `[can] tx #N OK` 连续成功（判据是 `TSR` 的 `TME`，且 `NART=0` 自动重传开着，
+所以 OK 等价于"收到 ACK"），而 C8T6 侧一行 `[can] rx` 都没有。
+
+用 SWD 热连接（`mode=hotplug`，不复位、不改代码）直读 C8T6 的 CAN1 寄存器（基址 `0x40006400`，
+顺序 **MCR/ MSR/ TSR/ RF0R/ RF1R/ IER/ ESR/ BTR**）与驱动静态变量，得到：
+
+| 项 | 值 | 判读 |
+|---|---|---|
+| `RF0R` | `0` | FIFO0 空、无溢出 |
+| `IER` | `0x00008602` | `FMPIE0=1`，RX0 中断确实开着 |
+| `ESR` | `0xFF000023` / `0xFF000063` | REC=255、TEC=0、EPVF=1，LEC 在 form(2)/crc(6) 间跳 |
+| `BTR` | `0x001E000F` | 125k、88.9%，与 ZET6 逐位一致 |
+| `MSR` | `0x00000C00` | bit11 RX=1（隐性）、RXM=1 |
+| `AFIO_MAPR` | `0x02004000` | CAN remap=10 → PB8=RX / PB9=TX |
+| `GPIOB CRH/IDR` | PB8=input floating、PB9=AF_PP；PB8=1、PB7=0 | 引脚与 STB 全对 |
+| RAM `s_rx_head/tail` | `0/0` | 软件队列一帧都没进过；`s_err_count=1`、`s_rx_overflow=0` |
+
+配套的物理实验：
+- 拔掉 C8T6 的 CAN 线 → ZET6 **立刻变 FAIL** ⇒ ACK 100% 来自 C8T6，锁定故障在 C8T6 接收端。
+- 模块只有 `3V3/GND/CTX/CRX/CH/CL` 六个脚（3.3V 收发器，SN65HVD230 一类），供电型号排除。
+- PB8 空闲实测 3.3V；**ZET6 断电 + 复位 C8T6 后 13s，ESR 仍是 `0x00000000`（REC=0、LEC=none）**
+  ⇒ PB8 上干净、CRX→PB8 线是通的，噪声/断线假设排除；错误只由"真的来帧"触发。
+
+结论：C8T6 的接收端在解码真帧时位级出错（CRC 通过时还能正常发 ACK，所以 ZET6 一直 OK，
+但帧随后被丢弃、进不了 FIFO）。500k 与 125k 下都完全收不到 —— 降 10 倍速度没有改善。
+因此做一次单纯的速度判别：**两侧同步降到 50k**。
+
+### 改动
+
+- `APP/APP.ioc`、`host_computer_ZET6/host_computer_ZET6.ioc` —
+  `CAN.Prescaler` 16→40，`CalculateBaudRate` 125000→50000，`CalculateTimeBit` 8000→20000，
+  `CalculateTimeQuantum` 444.44→1111.11。`BS1=15TQ` / `BS2=2TQ` 不动，采样点仍 88.9%。
+- `APP/Core/Src/can.c`、`host_computer_ZET6/Core/Src/can.c` — `hcan.Init.Prescaler = 40`，
+  注释写明这是判别试验而非最终配置。
+- `APP/Application/BSP/CAN/can_drv.h`、`.../can_drv.h` — `CANDRV_EXPECT_BAUD` 125000→**50000**。
+  ⚠ 三处必须同步，少一处 `CanDrv_Init()` 直接返回 -6。
+- 未改任何其他逻辑：过滤器仍只放行 `0x601`，主循环仍只打印 `[can] rx ...`。
+
+### 验证
+
+- 两侧均编译通过（APP 36 文件、ZET6 38 文件，FAIL 0），链接零错误。
+- `objdump` 确认 `movw #50000`（`CANDRV_EXPECT_BAUD`）与 `MX_CAN_Init` 里的 `#40`（Prescaler）
+  都已编入两侧固件。
+- 产物：
+  - `APP/build/Debug/APP_can_50k.bin` — **20788B，crc32 `0xB27FF921`**，FLASH 20696B + data 92，
+    烧 `0x08005000`。
+  - `host_computer_ZET6/build/Debug/ZET6_can_50k.bin` — **19768B，crc32 `0x434630DB`**，
+    FLASH 19672B + data 96，烧 `0x08000000`。
+- **两侧均未上板。**
+
+### 注意事项
+
+- 这是**判别试验**，不是最终配置。判读方式：
+  - 50k 能收到 → 速度相关（带宽、上升沿、反射、串扰、终端位置），回物理层查；
+  - 50k 表现完全一样（REC 仍冲 255、LEC 仍 crc/form）→ 速度无关，查晶振/时钟树
+    （读 `RCC_CFGR` 的 `SWS/PLLSRC/PLLMUL` 确认没有跑在 HSI 上）与 BTR。
+- 测完必须按结论回改速率（最终大概率回 125k），三处照上表一起改回。
+- SWD 读数命令可直接复用（不装代码也能看现场）：
+  `STM32_Programmer_CLI -c port=SWD freq=4000 mode=hotplug -u 0x40006400 0x20 out.bin`
+
+## 2026-11-25 21:20 — 判别试验：C8T6 改 SILENT（只听）模式
+
+### 问题（如有）
+
+50k 联调后 C8T6 侧 `ESR=0xFF000053`，**`LEC=5`（bit dominant error）**：自己发了显性位，
+却在自己的接收端读到隐性。C8T6 在这条总线上唯一会发的显性位就是 ACK，因此这条错误码说明
+**ACK 确实发出去了（ZET6 因此判 `tx OK`），但这一位没回到自己的接收端，整帧随即被丢弃**，
+FIFO 永远为空、一行 `[can] rx` 都没有。为把"发 ACK 时破坏自身接收"与"接收链本身坏"分开，
+把 C8T6 改成 SILENT 模式：硬件既不发 ACK、也不发错误帧，只接收。
+
+### 改动
+
+- `APP/APP.ioc` — `CAN.Mode` `CAN_MODE_NORMAL` → **`CAN_MODE_SILENT`**。
+- `APP/Core/Src/can.c` — `hcan.Init.Mode = CAN_MODE_SILENT`，注释写明是判别试验及判读方式。
+- `APP/Core/Src/main.c` — `[can] ... mode:` 那行把固定字符串 `"normal"` 改成按
+  `hcan.Init.Mode & CAN_BTR_SILM` 动态选 `"silent"` / `"normal"`。
+  原因：`CanDrv_GetMode()` 只看 `LBKM` 位，区分不了 SILENT 与 NORMAL，改这里才能从串口一眼
+  确认"烧进去的是哪一版"。**副产物：`[can] normal mode: 接收就绪…` 这行的匹配串以后会随模式变化。**
+- ZET6 侧**一行未改**（仍是 NORMAL / 50k），因为试验只要求单侧改变。
+- 位时序、过滤器（仍只放行 `0x601`）、主循环接收打印逻辑均未动。
+
+### 验证
+
+- `python Tools/verify_build.py APP` → COMPILE 36 files，FAIL 0，LINK rc=0。
+- `objdump -d --disassemble=MX_CAN_Init` 确认 `mov.w r3, #2147483648 (0x80000000)` 已写入
+  `Init.Mode`；`.rodata` 里出现 `silent\0` 字符串。
+- 产物：`APP/build/Debug/APP_can_silent.bin` — **20820B，crc32 `0x7BB8A8EC`**，烧 `0x08005000`。
+- **已烧入 C8T6 实机并复位运行**，SWD 读回确认：
+  `MCR=0x00010048`、`IER=0x00008602`、`BTR=0x801E0027`（**bit31 SILM=1、BRP=39→PSC40**）、
+  `ESR=0x00000000`、`RF0R=0`（连续 5 拍采样完全静止）。
+
+### 注意事项
+
+- ⚠ **烧录后 `-c port=SWD -d ... -v` 结束时芯片可能停在复位早期**（实测读到
+  `RCC_CFGR=0`、`APB1ENR=0`、`BTR=0x01230000` 等复位默认值，会被误判成"CAN 没初始化"）。
+  遇到这种读数先执行一次 `-c port=SWD freq=4000 -rst`，等 12s 再读。
+- 判读方式（见下一轮结论）：SILENT 下若打印出 `[can] rx ...` → 病因是"发 ACK 破坏自身接收"，
+  换收发器模块；若仍无帧且 `ESR=0` → 接收链本身无信号，同样指向模块/CRX 走线，与固件无关。
+- 试验结束必须把 `CAN.Mode` 与 `can.c` 一起改回 `CAN_MODE_NORMAL`（两处）。
+
+## 2026-11-25 21:28 — C8T6 回退 NORMAL（SILENT 结论已定，实机复现闭环）
+
+### 问题（如有）
+
+21:20 的 SILENT 判别已给出结论（C8T6 在 SILENT 下连续收到 14 帧且数据全对，NORMAL 下必定
+`LEC=5`、`REC→255`、整帧丢弃）。用户手上无备件模块，要求改回 NORMAL 再烧一次做确认。
+
+### 改动
+
+- `APP/APP.ioc` — `CAN.Mode` `CAN_MODE_SILENT` → **`CAN_MODE_NORMAL`**。
+- `APP/Core/Src/can.c` — `hcan.Init.Mode = CAN_MODE_NORMAL`，注释改为记录 SILENT 试验的结论
+  与"换模块后直接跑这版即可"。
+- `APP/Core/Src/main.c` — 那行动态取名的日志**保留**（`silent`/`normal` 按 `SILM` 位判断），
+  便于以后再做单侧 SILENT 判别时从串口直接确认固件版本。其它逻辑一行未动。
+- ZET6 侧仍未改动（NORMAL / 50k / 1s 一帧 / ARD 开）。
+
+### 验证
+
+- 编译通过（36 文件，FAIL 0，LINK rc=0）；`objdump` 确认 `MX_CAN_Init` 里 `Init.Mode`
+  写的是 `movs r3, #0`（= `CAN_MODE_NORMAL`）。
+- 产物：`APP/build/Debug/APP_can_normal50k.bin` — **20816B，crc32 `0x0DAF7A03`**，烧 `0x08005000`。
+- **已烧入实机 + 复位，12 秒后 SWD 读回**：
+  `MCR=0x00010048`、`IER=0x00008602`、`BTR=0x001E0027`（SILM=0、PSC40 ✓）、
+  `RF0R=0`、**`ESR=0xFF000053`（REC=255、TEC=0、LEC=5 bit dominant error）**。
+  与 21:20 之前 NORMAL 的表现逐位一致 —— **换回 NORMAL 后故障 100% 复现**，
+  而 SILENT 下同一硬件能全收，两次观测只差 `Mode` 一个变量，结论闭环。
+
+### 注意事项
+
+- 当前这版**不能用**：C8T6 会持续丢帧，ZET6 因收到 ACK 而误判 `tx OK`。
+- 未解决，硬件层面待办：换 3.3V CAN 收发器模块；或量模块 CRX 脚对地稳态电压
+  （若 ≈1.5V 这种中间值，说明 RXD 被别的东西拉着/推挽冲突，属于接线或板上器件问题）。
+
+## 2026-11-25 21:36 — 判别试验二：两侧降到 25k（位宽 20µs → 40µs）
+
+### 问题（如有）
+
+用户确认 **CRX 与 PB8 直连、中间无串阻、无并联输出，模块引脚与 PB8 均为 3.3V**，
+"两个推挽输出打架"的猜测被排除。而 ZET6 与 C8T6 的采样点完全相同（同为 88.9%），
+ZET6 在 17.8µs 处读到了 ACK 显性（所以 `tx OK`），C8T6 在同一时刻读到的却是隐性。
+总线显性 + 直连 + 电平正常 ⇒ 只能是**模块在自己驱动期间把 RXD 抑制/滞后了，且滞后 > 17.8µs**。
+为区分"抑制窗口是固定时长"与"整个发送位都被屏蔽"，把位宽拉长一倍。
+
+### 改动
+
+- `APP/APP.ioc`、`host_computer_ZET6/host_computer_ZET6.ioc` —
+  `CAN.Prescaler` 40→**80**、`CalculateBaudRate` 50000→**25000**、
+  `CalculateTimeBit` 20000→**40000**、`CalculateTimeQuantum` 1111.11→**2222.22**。
+  `BS1=15TQ` / `BS2=2TQ` 不动，采样点仍 88.9%（绝对时间从 17.8µs 变为 35.6µs）。
+- 两侧 `Core/Src/can.c` — `hcan.Init.Prescaler = 80`，注释写明本次试验的假说与判读方式。
+- 两侧 `Application/BSP/CAN/can_drv.h` — `CANDRV_EXPECT_BAUD` 50000→**25000**。
+- 未改任何逻辑：过滤器仍只放行 `0x601`，`Mode` 保持 NORMAL，主循环打印不变。
+
+### 验证
+
+- 两侧编译通过（APP 36 文件、ZET6 38 文件，FAIL 0，LINK rc=0）。
+- `objdump` 确认两侧 `MX_CAN_Init` 里都有 `movs #80 (0x50)`。
+- 产物：
+  - `APP/build/Debug/APP_can_25k.bin` — **20816B，crc32 `0x561B419F`**，烧 `0x08005000`。
+  - `host_computer_ZET6/build/Debug/ZET6_can_25k.bin` — **19768B，crc32 `0x6197147E`**，烧 `0x08000000`。
+- C8T6 **已烧入并复位**，SWD 读回 `BTR=0x001E004F`（BRP=79 → PSC=80 ✓）。
+  此时 ZET6 仍是 50k，两侧速率不匹配，`ESR=0xFF000053` 属预期，**无判定意义**。
+
+### 注意事项
+
+- ⚠ **两侧必须同时是 25k**，一侧 50k 一侧 25k 会完全不通且 `REC` 直接顶满。
+- 判读：25k 下 C8T6 能打印 `[can] rx ...` 且 `LEC` 不再固定为 5 → 抑制窗口是固定时长（情况 A），
+  可先用 25k 跑 OTA（约 2.2KB/s，20KB 固件约 9s）；若仍是 `LEC=5` → 整位屏蔽（情况 B），只能换模块。
+- 测完按结论回改速率（最终大概率回 125k 或换模块后重定），三处照上表一起改。
+
+## 2026-11-25 21:40 — 25k 判定结果：情况 B（整位屏蔽），速率无效
+
+### 结果
+
+两侧均烧 25k 并复位运行，ZET6 侧 `[can] init OK, 25000 bps` 且持续 `tx #N OK err=2`（有 ACK），
+C8T6 侧 `[can] init OK, 25000 bps` + `接收就绪`，但**没有任何一行 `[can] rx`**。
+
+C8T6 SWD 读回（连采 3 拍，完全静止）：
+
+| 项 | 50k | **25k** |
+|---|---|---|
+| `BTR` | `0x001E0027` | `0x001E004F`（BRP=79 → PSC=80 ✓） |
+| `RF0R` | 0 | **0** |
+| `ESR` | `0xFF000053` | **`0xFF000053`** |
+| `LEC` | 5 | **5（一字未变）** |
+| `REC` | 255 | **255** |
+
+**位宽从 20µs 拉到 40µs，错误码完全没有变化** ⇒ 抑制/滞后与时间无关，不是固定时长的模拟延迟，
+而是"驱动期间 RXD 被完全屏蔽/强制隐性"（情况 B）。25k 这条路走不通，已回退结论。
+
+### 结论
+
+这块收发器模块**无法用于任何需要发送的 CAN 节点**（ACK 是接收方必发的位）。它能收（SILENT 下
+14 帧全对）、能驱动总线（对端收到 ACK），唯独不能回读自己驱动的位。
+
+### 待办（按优先级）
+
+1. **确认模块上 8 脚芯片的丝印型号**。若为 `TJA1050` / `PCA82C250` / `TJA1042` 等 **5V 器件**，
+   则此前"3V3 供电"就是根因 —— 5V 芯片在 3.3V 下驱动差压只有 1.3V（用户实测 H≈3.0 / L≈1.7，
+   正常应为 2.0V），完全符合"能发不能回读"的退化表现。此时改接 5V 供电（PB8 是 FT 引脚，
+   可容忍 5V）大概率直接解决。**但若是 SN65HVD230 / VP230 这类 3.3V 器件，切记不可接 5V（会损坏）。**
+2. 换一块确认可用的 3.3V 收发器模块。
+3. 权宜：C8T6 常驻 SILENT + ZET6 关自动重传（`AutoRetransmission = DISABLE`），
+   做单向传输，先跑通 OTA 数据通道（无块确认）。
+
+### 21:42 补充：模块芯片丝印确认为 `VP230`（SN65HVD230，3.3V 器件）
+
+- 供电 3.3V 是**正确**的，5V 方案作废（接 5V 会烧毁该器件，绝对禁止）。
+- 因此"5V 芯片被 3.3V 供电"的根因假说排除，剩下的解释只有：这颗 `VP230` 是仿制/降级品
+  （市面上大量用 5V die 打磨后标 VP230），其"驱动显性时回读自身 RXD"的模拟功能失效。
+  这与全部观测一致：能收（SILENT 14 帧全对）、能驱动总线（对端收到 ACK）、差压偏低（1.3V，
+  低于 3.3V 器件典型 2.0V）、`LEC=5` 且对位宽不敏感（25k/50k/125k 均如此）。
+- **下一步零成本验证：把 C8T6 与 ZET6 两块模块互换。** 关键理由：ZET6 那块模块**从未被验证过
+  "发送时回读"**——它全程只做发送（C8T6 从没回过帧），所以它很可能是好的。
+  互换后若 C8T6 能正常收帧 → 确认原 C8T6 模块损坏；若仍不能 → 两块同批都有问题。
+  （21:44 用户说明 ZET6 是**板载**收发器，无法互换，此项作废。）
+
+## 2026-11-25 21:55 — 结案：C8T6 用飞线接到另一块板子的收发器后，25k 下接收正常
+
+### 做法
+
+用户把 C8T6 的 CAN 信号**飞线**到另一块板子上的 CAN 收发器（弃用原 `VP230` 模块），
+两侧仍为 25k / NORMAL，未改动任何代码。
+
+### 结果
+
+C8T6 串口连续输出：
+
+```
+[can] init OK, 25000 bps, sample 88.8%, normal
+[can] normal mode: 接收就绪，等待上位机 0x601
+[can] rx id=0x601 dlc=8 data=A5 5A 05 00 00 00 01 00
+[can] rx id=0x601 dlc=8 data=A5 5A 06 00 00 00 01 00
+[can] rx id=0x601 dlc=8 data=A5 5A 07 00 00 00 01 00
+```
+
+SWD 读回（连采 3 拍，全部一致）：
+
+| 项 | 坏模块（25k） | **飞线后（25k）** |
+|---|---|---|
+| `BTR` | `0x001E004F` | `0x001E004F` ✓ |
+| `ESR` | `0xFF000053` | **`0x00000000`** |
+| `TEC/REC` | 0 / **255** | **0 / 0** |
+| `LEC` | 5（bit dominant） | **0（none）** |
+| `RF0R` | 0 | 0（帧被主循环及时取走） |
+
+### 结论（结案）
+
+**故障件就是那颗 `VP230` 模块，固件、接线、位时序、过滤器、时钟、终端电阻全部正常，无一需要修改。**
+`REC` 从 255 常驻变成 0 并稳定保持，是"发送/回读路径恢复"的最直接证据。
+
+### 后续
+
+- 当前两侧均为 **25k / NORMAL**，通信已通。25k 下 OTA 约 2.2KB/s（20KB 固件约 9s）。
+- 若要恢复原定速率，需三处 × 两侧同步改回 125k（`PSC=16`）：`.ioc` 的 `Prescaler`/`CalculateBaudRate`、
+  `can.c` 的 `Prescaler`、`can_drv.h` 的 `CANDRV_EXPECT_BAUD`。
+- 飞线属临时接线，升速前建议缩短走线并尽量双绞，125k 对信号质量比 25k 敏感。
+
+## 2026-11-25 21:59 — 恢复 125k（两侧同步），兼作飞线边沿裕量验证
+
+### 问题（如有）
+
+`VP230` 模块换掉后，25k 下通信已正常（`ESR=0`、`REC=0`、连收多帧正确）。但 25k 只是诊断期的
+降速试验值，OTA 吞吐约 2.2KB/s（20KB 固件约 9s），偏慢；原定目标速率是 125k（约 11KB/s）。
+
+### 改动（三处 × 两侧，共 6 个文件，逻辑一行未动）
+
+| 位置 | 旧 → 新 |
+|---|---|
+| `APP/APP.ioc`、`host_computer_ZET6/host_computer_ZET6.ioc` | `Prescaler` 80→**16**、`CalculateBaudRate` 25000→**125000**、`CalculateTimeBit` 40000→**8000**、`CalculateTimeQuantum` 2222.22→**444.44** |
+| `APP/Core/Src/can.c`、`host_computer_ZET6/Core/Src/can.c` | `hcan.Init.Prescaler = 16`，并把堆积的多段降速试验注释合并为一段结论式说明 |
+| `APP/Application/BSP/CAN/can_drv.h`、`host_computer_ZET6/Application/BSP/CAN/can_drv.h` | `CANDRV_EXPECT_BAUD` 25000→**125000UL** |
+
+`BS1=15TQ / BS2=2TQ` 不变 → 采样点仍 88.9%（`36MHz / (16×18) = 125kbps`）。
+`CAN.Mode` 两侧均为 `CAN_MODE_NORMAL`；过滤器仍只放行 `0x601`；ZET6 仍每 1s 发一帧 `0x601`。
+
+### 验证
+
+- `python Tools/verify_build.py`：两侧全过（APP 36 文件 / ZET6 38 文件，FAIL 0，LINK rc=0）。
+- `objdump` 复核：两侧 `MX_CAN_Init` 内均为 `movs #16`（分频），`125000` 常量各 1 处。
+- C8T6 已烧 `0x08005000` 并 `-rst`；SWD 读回 `BTR=0x001E000F`（BRP=15 → PSC=16）✓。
+  读到的 `ESR=0xFF000013`（TEC=19、REC=0、LEC=1 stuff）是因为此刻 **ZET6 还跑在 25k**、
+  两侧速率不匹配，**无判定意义**，烧完 ZET6 后两侧都复位再看。
+
+### 产物
+
+| 文件 | 大小 | crc32 | 烧录地址 |
+|---|---|---|---|
+| `APP/build/Debug/APP_can_125k.bin` | 20820B | `0xFB159A69` | `0x08005000` |
+| `host_computer_ZET6/build/Debug/ZET6_can_125k.bin` | 19768B | `0x53552E72` | `0x08000000` |
+
+`ZET6_can_125k.bin` 的 crc32 与更早的 `ZET6_can_txonly.bin` 完全一致，符合预期（ZET6 侧
+除了 Prescaler 回到 16 之外没有任何改动，等于回到 125k 版本的同一份二进制）。
+
+### 判读与回退
+
+- 125k 下 `ESR=0`、`REC=0`、C8T6 持续打印 `[can] rx id=0x601 ...` → 定在 125k。
+- 出现 `LEC≠0`、`REC` 上涨或丢帧 → 说明临时飞线撑不住 125k 边沿，回退 25k（`PSC=80`），
+  等收发器模块走正规接线后再提速。
+
+### 实机验证（22:05，用户烧完 ZET6 后）
+
+C8T6 串口连续输出 `[can] rx id=0x601 dlc=8 data=A5 5A 05 00 00 00 01 00`（序号递增循环），
+SWD 连采 3 拍全部为：
+
+| 项 | 值 | 含义 |
+|---|---|---|
+| `BTR` | `0x001E000F` | PSC=16 → 125k ✓ |
+| `ESR` | **`0x00000000`** | TEC=0、REC=0、LEC=0，**零错误** |
+| `RF0R` | `0` | 帧被主循环及时取走，无积压 |
+
+**结论：125k 在临时飞线上可用，零错误码。** 但注意这只验证了 **1 帧/秒** 的低速场景；
+OTA 是连续背靠背突发（125k 下 8 字节帧约 0.72ms 间隔），FIFO 只有 3 级、
+且 C8T6 主循环每帧打一行串口（115200 下约 5ms）会严重阻塞 —— **连续突发必须单独压测**，
+见下一步计划。
+
+## 2026-11-26 16:15 — ZET6 移除 CAN 周期测试帧（不再每秒发一帧）
+
+### 问题（如有）
+
+用户要求关掉 CAN 总线上持续发送的测试代码：ZET6 主循环每 1 秒发一帧 `0x601`，
+既一直占着总线，又不断往串口刷 `[can] tx #N` 日志，干扰串口落盘观察。
+物理层已在 11-25 22:05 验证通过（125k，`ESR=0` 连采 3 拍），不再需要常驻心跳。
+用户同时明确 **阶段 1c 突发压测不做了**，因此不在代码里预留压测专用的节拍/序号变量。
+
+### 改动
+
+- `host_computer_ZET6/Core/Src/main.c` — 删除 4 处周期发送相关代码，共约 70 行：
+  1. 宏 `CAN_TEST_TX_PERIOD_MS` / `CAN_TEST_TX_TIMEOUT_MS` 及其注释块 → 改为一段删除说明；
+  2. normal 模式分支的 `每 %ums 发送一帧 id=...` 日志 → 改为 `normal mode: 接收就绪，不主动发帧`；
+  3. 变量 `can_tx_tick` / `can_tx_seq` 及 tick 回退初始化 → 删除；
+  4. 主循环末端的整段 `if(CanDrv_GetMode()==NORMAL){ Timer_Expired→CanDrv_Send→打印 OK/FAIL }` → 删除，
+     换成一行删除说明；`last_rx` 保留供串口空闲 Flush 使用。
+- `host_computer_ZET6/Core/Src/main.c::main` — `can_drv.h` 的 include 注释同步更新
+  （"1b 起 Normal 模式周期发测试帧" → "Normal 模式就绪但不主动发帧"）。
+
+**保留不动**：`MX_CAN_Init()` / `CanDrv_Init()` / `CanDrv_Send()` / 回环自测分支 / 125k 全部参数。
+CAN 外设仍在就绪态，只是主循环不再自动发帧；将来若需要主动发帧，由调用方显式传超时参数。
+
+### 副作用与注意
+
+- 上电后 ZET6 日志不再出现 `[can] tx #N ...`，C8T6 侧也不再收到周期 `0x601` 帧
+  （其 `[can] rx` 行会停）——这是预期行为，不是链路故障。
+- `Timer_Expired()` 在 ZET6 工程里已无调用方，但保留在 `board.c` 未删（公共工具函数，无警告）。
+- `CANDRV_ID_REQ` 宏仍定义在 `can_drv.h`，未被引用，保留给以后的上层协议使用。
+
+### 验证
+
+`python Tools/verify_build.py host_computer_ZET6`：38 文件编译 FAIL 0，LINK rc=0。
+**未上板**（本轮只改日志/发送节拍，不影响串口落盘；如需实机确认开机日志，烧 `0x08000000`）。
+
+## 2026-11-26 16:26 — 阶段 1：按键查询是否有新程序（仅握手，不下载）
+
+### 问题（如有）
+
+用户要求完成 CAN OTA 的第一步：C8T6 按 KEY1 向上位机发"是否有新程序"查询帧，
+ZET6 若有完整固件则回"有 + 长度 + CRC"。后续步骤（更新请求 / 分帧下发 / 写 W25Q /
+Boot 搬运）本轮不实现。用户明确"先做到这一步"。
+
+### 改动
+
+- `APP/Core/Src/main.c::PD 区` — 新增阶段 1 协议宏：`OTA_CAN_OP_QUERY`(0x10)、
+  `OTA_CAN_OP_REPLY`(0x11)、`OTA_CAN_PROTO_VER`(0x01)、查询超时 100ms、按键防抖 50ms。
+  帧方向复用现有 ID：下位机发 0x581、上位机回 0x601，两侧过滤器天然匹配，驱动零改动。
+  附帧格式注释（QUERY 8B / REPLY 长度 uint16 小端 + CRC 低 32 位）。
+- `APP/Core/Src/main.c::PV 区` — 新增 `s_key1_prev/s_key1_fired/s_key1_t`，
+  用于 KEY1(PA0) 电平变化检测 + 50ms 防抖 + 按住只发一帧的边沿锁存。
+- `APP/Core/Src/main.c::main while` — 主循环加按键扫描：按下且稳定 50ms 后
+  `CanDrv_Send(0x581, QUERY帧, 8, 100ms)`，打 `[can] query sent/FAIL`；
+  CAN 接收保留原十六进制行，新增 REPLY 帧的可读行 `[can] reply YES/NO len=.. crc=..`。
+  **只解析打印，不发更新请求、不写 Flash。**
+- `host_computer_ZET6/Core/Src/main.c::PD 区` — 同一套协议宏（两侧逐字一致），
+  附"有新程序 = 槽 A 头有效"的判据说明。
+- `host_computer_ZET6/Core/Src/main.c::main while` — 主循环末尾加 CAN 应答段：
+  收到 0x581 QUERY 时调 `OtaSlot_ReadHeader(OTA_SLOT_A)`，有效则回 0x601 REPLY
+  （B1=1 + 长度 + CRC），无效则 B1=0；打 `[can] query from host: ... reply YES/NO ...`。
+  周期测试帧段保留删除说明，改为"收到查询才应答"。
+
+### 副作用与注意
+
+- `can_drv.h` 里 `CANDRV_ID_REQ`(0x601)/`CANDRV_ID_RSP`(0x581) 的语义注释仍是
+  "上位机请求 / 下位机响应"，本阶段起消息方向反转（下位机主动查询），靠 opcode 区分，
+  未改驱动注释以免动到共用文件；后续抽协议头文件时一并订正。
+- 长度字段只取 16 位（当前 bin 约 20KB，够用）；固件超过 64KB 时阶段 2 要扩字段。
+- KEY1=PA0 为浮空输入，按下为低；若板子实际接法相反（按下为高），只需把
+  `key1_now` 的三元判断翻转，其余逻辑不变。**未上板确认按键接法。**
+- ZET6 侧 REPLY 的 CRC 来自槽头（`FinishOta` 回读校验通过后写），若槽 A 从未收过
+  完整 bin，头无效 -> 回"无"，不会误报。
+- 阶段 1 纯收发、不碰 W25Q 写入路径，串口落盘链路不受影响。
+
+### 验证
+
+`python Tools/verify_build.py APP`：36 文件 FAIL 0，LINK rc=0。
+`python Tools/verify_build.py host_computer_ZET6`：38 文件 FAIL 0，LINK rc=0。
+**未上板**；实机判据：按 KEY1 后 C8T6 打 `[can] query sent`、ZET6 打
+`[can] query from host: slot A valid, reply YES ...`、C8T6 再打 `[can] reply YES len=..`。
+
+## 2026-11-26 16:42 — ZET6 增加空闲自动收尾，解决串口助手不发尾部导致 CAN 查询恒为 NO
+
+### 问题
+
+实机按键查询时 ZET6 恒回 `reply NO`。日志显示 21204B 数据全部落盘、累计正确，
+但缺 `[ota] 尾部：长度=..` / `[ota] 校验通过` / `[ota] 槽 A 已保存`，槽头从未写入。
+根因：串口助手 `Tools/SerialAssist/serial_assist.py::RE_READY` 只认
+`[ota] ready, app=.., page=..B, proto=2`，而 ZET6 打的是 `[recv] 就绪，外部 Flash 槽A ...`，
+匹配失败 -> `ota_proto` 留在默认 1（老协议）-> 发完 bin 不追加 12 字节 `OTAE` 尾部
+（日志里没有 `--- 已发尾部记录 ... ---` 可佐证）-> `FinishOta()` 不执行 -> 槽头空。
+
+### 改动
+
+- `host_computer_ZET6/Core/Src/main.c::Includes/PV` — 加 `#include "crc32.h"` 与
+  `s_tail_seen`（本次上电是否已收尾的互斥锁）；带注释说明为什么需要它。
+- `host_computer_ZET6/Core/Src/main.c::HandleRx` — 识别到合法 OTAE 尾部即置 `s_tail_seen=1`，
+  **无论 FinishOta 成功与否**。防止尾部校验失败提前 return 后，空闲路径又把坏数据扶正成有效槽。
+- `host_computer_ZET6/Core/Src/main.c::main while 空闲分支` — 触发条件由 `Ota_Fill()>0`
+  改为 `s_ota_started && !s_tail_seen && Ota_Total()>0 && 2s 超时`；
+  分支内先 `Ota_Flush()`，再 `Crc32_Flash(槽 A 数据区, Ota_Total())` 算 CRC，
+  用 `OtaSlot_BuildHeader` + `OtaSlot_WriteHeader` 写槽头，打
+  `[ota] 自动收尾：槽 A 已保存 N B CRC=...`，末尾置 `s_tail_seen=1` 只做一次。
+  原条件在"最后一段恰好凑满 4096"时 `Ota_Fill()==0` 会漏写槽头，一并修正。
+
+### 副作用与注意
+
+- **CRC 不再是独立校验源**：改为从 W25Q 读回自己算，只能证明落盘内容稳定，
+  证明不了串口传输过程没丢字节；丢字节会在后续 CAN 下发时由下位机 CRC 比对发现。
+- **传一半断线会被当成完整固件**（2 秒无数据即认为传完）；要堵需增加长度预声明，
+  本轮未做。
+- 不调 `OtaSlot_VerifyData()`：CRC 就是从 Flash 读回算的，再比对必然一致，无意义。
+- 带尾部的脚本（`ota_headless.py` / 修好的助手）走原 `FinishOta` 路径，行为不变。
+- 串口助手本身的协议判定未改（在 `Tools/`，不属固件）；若以后要长期用 GUI 传，
+  需另改 `serial_assist.py` 并重新打包 exe。
+
+### 验证
+
+`python Tools/verify_build.py host_computer_ZET6`：38 文件 FAIL 0，LINK rc=0。
+**未上板**。预期：用现有助手发裸 bin -> 2 秒后打 `[ota] 自动收尾：槽 A 已保存` ->
+按 KEY1 得到 `reply YES`。
+
+## 2026-11-26 16:55 — 修复自动收尾 CRC 算错：Crc32_Flash 不能读 W25Q
+
+### 问题
+
+上条改动的实机日志：握手三段全通（`query sent` / `reply YES sent` / C8T6 `reply YES len=21204`），
+但槽头 CRC 报 `0x9C69185F`，与源 bin（`APP.bin` 21204B）的 `0x91C2B6C8` 不符。
+根因：自动收尾里调用了 `Crc32_Flash(OtaSlot_DataAddr(OTA_SLOT_A), n)`，
+而该函数用 `*(volatile const uint8_t*)addr` 直接解引用，只对能 XIP 的片内 Flash 有效；
+W25Q 是 SPI 外挂、不支持内存映射，`0x001000` 只是 W25Q 内部地址，
+直接解引用实际读到 STM32 地址空间别处（片内 Flash 别名区），CRC 与固件内容无关。
+`ota_slot.c::OtaSlot_VerifyData` 早有正确示范（用 `W25q_Read` 分块读，注释明确写了
+"W25Q 不支持 XIP"），照搬时误用了错的函数。
+
+### 改动
+
+- `host_computer_ZET6/Core/Src/main.c::CalcSlotDataCrc`（新增，USER CODE BEGIN 0 区）—
+  经 `W25q_Read` 按 `W25Q_PAGE_SIZE`(256B) 分块读回槽数据，用 `Crc32_Update` 累计、
+  末尾取反，与 `OtaSlot_VerifyData` 和上位机 zlib.crc32 口径一致；带注释说明为什么
+  不能用 `Crc32_Flash` 及这次踩坑的实机数值。静态 256B 缓冲不进栈。
+- `host_computer_ZET6/Core/Src/main.c::main while 空闲分支` — 把
+  `Crc32_Flash(...)` 换成 `CalcSlotDataCrc(..., &crc)`；读回失败时不写槽头（宁可 CAN 回"无"，
+  也不广播错 CRC），打 `[ota] 自动收尾：读回 CRC 失败，槽头未写`。同步更新注释。
+
+### 副作用与注意
+
+- 阶段 1 的"有无"判断不受影响（槽头 magic/长度仍有效），但**修复前那份槽头的 CRC 是错的**；
+  烧新固件后必须重新传一次 bin 覆盖槽头，否则下位机拿 CRC 比对会失败。
+- 用户明确：以后无需我代编译/生成 bin，用户自己编译。本轮只跑 `verify_build.py` 验证编译，
+  未生成烧录用 bin。
+
+### 验证
+
+`python Tools/verify_build.py host_computer_ZET6`：38 文件 FAIL 0，LINK rc=0。**未上板**。
+验收判据（比上轮更严）：自动收尾日志里的 CRC 必须等于 `zlib.crc32(APP.bin)`，
+且 C8T6 `reply YES` 帧里的 CRC 与之逐字节一致。
+
+## 2026-11-26 19:30 — 阶段 2：按键触发更新请求 + CAN 分帧下发 + 下位机落盘
+
+### 问题（如有）
+
+阶段 1 按键查询已实机通过（reply YES len=21204 crc=0x91C2B6C8）。用户要求继续做到
+"下位机发更新请求 -> 上位机分帧下发 bin -> 下位机写外部 Flash -> 走正常升级流程"，
+并明确三项决策：去重、块级 ACK 流控、收到回应准备发 bin 后才屏蔽串口喂数（日志 TX 照常）。
+
+### 改动
+
+- `APP/Core/Src/main.c::协议宏/会话状态` — 新增 0x12 UPDATE_REQ / 0x13 DATA / 0x14 ACK
+  三个 opcode；5B/帧载荷、16 帧/块；会话三态 IDLE->WAIT_REPLY->RECEIVING。
+  注释写明 CAN 帧 8B 的分配（B0 opcode + B1B2 seq + B3~B7 5B 数据）。
+- `APP/Core/Src/main.c::OtaCan_IsCurrentFw` — 去重：用 `Crc32_Flash(0x08005000, len)`
+  比对 REPLY 的 CRC；长度 0 或超 App 区 44KB (`OTA_CAN_APP_MAX`) 时判非法拒收，
+  防止读到片内 Flash 末尾之外。
+- `APP/Core/Src/main.c::OtaCan_SendAck` — 统一 ACK 出口（B1B2=最后 seq，B3=0 正常/非0 中止）。
+- `APP/Core/Src/main.c::主循环 KEY1 段` — 只在 IDLE 态允许按键；查询发成功才进 WAIT_REPLY。
+- `APP/Core/Src/main.c::主循环串口段` — RECEIVING 态不调 `Boot_Loader_Getlen()`（屏蔽串口喂 W25Q），
+  但日志 `Uart_Printf` 照常。避免串口与 CAN 两路数据交错写同一固件区。
+- `APP/Core/Src/main.c::主循环 CAN 状态机` — REPLY 回显长度+CRC 发 UPDATE_REQ，
+  经 `Boot_Loader_Init()` 干净交接 W25Q；DATA 帧攒块缓冲 `s_ota_block[80]`，
+  收满一块才 `OtaW25q_Feed`（擦写发生在回 ACK 前、上位机停发的静默窗），
+  收齐后 `Boot_Loader_Finish()`（内部补尾+回读比对+写 PENDING 标志）。
+  收齐与块满改互斥分支，避免末帧双 ACK；收尾 ACK 的 seq 用 `expect_seq-1` 对齐上位机校验。
+  新增 `s_ota_fed` 累计已 Feed 字节数，末帧按它裁掉填充字节（用 `OtaW25q_Total()` 会多算
+  扇区里未落盘的尾巴、把补 0 写进固件）。收包超时 1.5s 防会话挂死。
+- `host_computer_ZET6/Core/Src/main.c::协议宏/发送状态` — 同套 opcode/参数（两侧逐字一致）；
+  发送态 IDLE->SENDING，槽 A 数据区边读边发。
+- `host_computer_ZET6/Core/Src/main.c::OtaCan_SendDataFrame` — 从 `OtaSlot_DataAddr(A)` 用
+  `W25q_Read` 取 5B/帧，末帧不足补 0（下位机按长度裁）；读失败返回错误不发全 0 假数据。
+- `host_computer_ZET6/Core/Src/main.c::OtaCan_OnAck` — 单帧 ACK 处理，校验 seq=本块最后一帧，
+  错误 ACK 立即中止。刻意不在此取队列——CAN 只有一个接收队列，两处取会互相吞帧。
+- `host_computer_ZET6/Core/Src/main.c::主循环 CAN 统一分发` — 所有 0x581 帧一处取干净，
+  按 opcode 分发 QUERY/UPDATE_REQ/ACK。UPDATE_REQ 校验回显长度+CRC 与槽头一致才启动，
+  防止查询与请求之间槽被重传覆盖。分帧推进每圈最多 1 帧、块内 1ms 间隙，
+  满 16 帧或全部发完进等 ACK 态，1.5s 超时中止。
+
+### 副作用与注意
+
+- 这是块级 ACK 的首次实机尝试（用户选择"赌一把"），突发 FIFO 风险靠"收满一块才 Feed +
+  回 ACK 前完成擦写"规避；若实测仍丢帧，退路是缩块或逐帧 ACK。
+- 分帧数按 5B/帧：21204B ≈ 4241 帧，125k 约 3.8s（不含擦写空窗）。
+- 下位机去重意味着同一份 bin 再次按键会被跳过（打"已是当前固件"）——这是预期行为。
+- 未做重传：seq 错位/写入失败回 err ACK 让上位机停，靠用户重跑一轮恢复。
+
+### 验证
+
+`python Tools/verify_build.py APP`：36 文件 FAIL 0 / LINK rc=0。
+`python Tools/verify_build.py host_computer_ZET6`：38 文件 FAIL 0 / LINK rc=0。
+**未上板**。验收判据：按键后 C8T6 打 `[ota] 开始 CAN 接收`，ZET6 打 `[ota] 开始下发`，
+分帧完成后 ZET6 打 `[ota] 下发完成`、C8T6 打 `Finish=0`，且 `[wota] UPDATE FLAG SET` 出现，
+复位后 Boot 搬运、App 运行。
+
+## 2026-11-26 19:44 — KEY2(PA1) 人工触发回滚
+
+### 问题（如有）
+
+阶段 2 端到端闭环已实机通过（按键查询→分帧下发→落盘→Boot 搬运→App 确认→flag erased），
+去重分支也实机 PASS（同 bin 再按键跳过下载）。用户要求加"按下 KEY2 回滚"，用于主动
+触发回滚链路，不必等 App 跑飞。
+
+### 改动
+
+- `APP/Core/Src/main.c::PV` — 新增 s_key2_prev / s_key2_fired / s_key2_t，与 KEY1 各自
+  独立锁存，避免共用 fired 吞掉第二次按键。
+- `APP/Core/Src/main.c::主循环 KEY2 段` — PA1 按下低电平、防抖 50ms、与 KEY1 同款边沿检测；
+  先 `OtaBackup_ReadHeader` + `OtaBackup_VerifyData` 校验备份有效性，仅当有效才
+  `OtaFlag_Write(hdr.length, hdr.crc32, OTA_FLAG_APPLIED)` + `HAL_NVIC_SystemReset()`。
+  Boot 读 APPLIED 走已实机验证的 ApplyRollback：从 0x201000 恢复→CRC 校验→擦标志→跳 App。
+- 只在 `s_ota_st == IDLE` 时响应 KEY2，避免下载中两路抢 W25Q。
+
+### 副作用与注意
+
+- 不在 App 里直接擦写片内 Flash：F103 单 bank，App 在 0x08005000 取指时擦同 bank 必 HardFault；
+  写标志+复位把恢复动作交给 Boot 是唯一安全路径。
+- 备份区存的是"最近一次确认过的固件"（App 启动时备份当时的片内）。刚升级完就按 KEY2，
+  备份区=当前这份新固件，回滚是把同一份重搬一遍 —— 验证的是回滚链路通不通，
+  **不是退回更早版本**；要退更早版本需改备份时机（本轮未做）。
+- 备份无效时不写标志、不复位，fail-safe 优先。
+- 与 `OTA_TEST_CRASH==1`（上电按住 KEY2 制造 HardFault）共用 PA1 但时机不同，测试桩开启时
+  其 crash 注入在确认逻辑之前，本段仍可工作；默认宏为 0。
+
+### 验证
+
+`python Tools/verify_build.py APP`：36 文件 FAIL 0 / LINK rc=0。**未上板、未生成 bin**（用户自编译）。
+验收判据：按 KEY2 后打 `[app] KEY2 rollback: flag APPLIED OK, reset...`，复位后 Boot 打
+`[apply] flag: state=APPLIED` → `[apply] ROLLBACK: restoring ...` → `[apply] rollback done`。

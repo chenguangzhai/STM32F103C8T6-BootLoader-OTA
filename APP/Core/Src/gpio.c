@@ -54,7 +54,15 @@ void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, W25Q_CS_Pin|LED2_Pin|CAN_STB_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, W25Q_CS_Pin|LED2_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  /* 2026-11-25：CAN_STB(PB7) 从置高改为置低。TJA1050 的 STB 高电平 = Standby，
+     收发器既不驱动总线也不把 RX 送出来，帧既发不出去也收不进来；
+     拉低才是 Normal 模式。.ioc 里 PB7.PinState 已同步改为 GPIO_PIN_RESET，
+     重新生成代码不会把高电平写回来。副作用：CAN 收发器从上电起就常通，
+     多耗几 mA，但只有这样 ZET6 发来的 0x601 才可能进到本侧。 */
+  HAL_GPIO_WritePin(CAN_STB_GPIO_Port, CAN_STB_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
