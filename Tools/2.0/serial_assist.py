@@ -61,6 +61,20 @@ except ImportError:
 APP_TITLE = "STM32 OTA 串口助手"
 APP_VER = "2.1"
 
+# 接收区可选的文本编码（HEX 是单独模式，不走解码器）
+# UTF-16 带 BOM 自动识别；UTF-16LE/BE 用于没有 BOM 的裸流。
+DISPLAY_MODES = {
+    "UTF-8":    "utf-8",
+    "ASCII":    "ascii",
+    "GBK":      "gbk",
+    "GB18030":  "gb18030",
+    "Big5":     "big5",
+    "UTF-16":   "utf-16",
+    "UTF-16LE": "utf-16-le",
+    "UTF-16BE": "utf-16-be",
+}
+DISPLAY_OPTIONS = list(DISPLAY_MODES) + ["HEX"]
+
 BAUD_LIST = ["9600", "19200", "38400", "57600", "115200",
              "230400", "460800", "921600"]
 
@@ -770,9 +784,9 @@ class SerialChannel(object):
         self.reader_thread = None
         self.q = queue.Queue()      # (kind, payload) 主线程消费
 
-        # ---- 解码器（增量式，解决多字节字符被切开变乱码）----
-        self.dec_utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        self.dec_gbk = codecs.getincrementaldecoder("gbk")("replace")
+        # ---- 解码器（增量式，解决多字节字符被切开变乱码；
+        #      具体用哪个 codec 由「显示」下拉决定，见 _reset_decoder）----
+        self.decoder = None
 
         # ---- HEX 显示缓冲 ----
         self.hex_buf = b""
@@ -826,9 +840,20 @@ class SerialChannel(object):
         self.ocd_serial = str(self._cfg_get("ocd_serial", "ocd_serial", "") or "")
         self.baud_var.set(str(self._cfg_get("baud", "baud", "115200")))
         mode = str(self._cfg_get("disp", "disp_mode", "UTF-8"))
-        self.disp_mode.set(mode if mode in ("UTF-8", "GBK", "HEX") else "UTF-8")
+        if mode not in DISPLAY_OPTIONS:
+            mode = "UTF-8"
+        self.disp_mode.set(mode)
         self.timestamp.set(bool(self._cfg_get("ts", "timestamp", False)))
         self.autoscroll.set(bool(self._cfg_get("scroll", "autoscroll", True)))
+        self._reset_decoder()
+
+    def _reset_decoder(self):
+        """按当前「显示」模式重建增量解码器；HEX 模式不需要解码器。"""
+        codec = DISPLAY_MODES.get(self.disp_mode.get())
+        if not codec:
+            self.decoder = None
+            return
+        self.decoder = codecs.getincrementaldecoder(codec)("replace")
 
     def save_cfg(self, cfg):
         """把本路的设置写进配置字典（键带 1/2 后缀）。"""
@@ -892,8 +917,8 @@ class SerialChannel(object):
         tk.Label(r2, text="显示", bg=C_BG, fg=C_SUB,
                  font=(FONT_UI, 8)).grid(row=0, column=0)
         self.disp_mode = tk.StringVar(value="UTF-8")
-        cb_mode = ttk.Combobox(r2, textvariable=self.disp_mode, width=6,
-                               values=["UTF-8", "GBK", "HEX"], state="readonly",
+        cb_mode = ttk.Combobox(r2, textvariable=self.disp_mode, width=9,
+                               values=DISPLAY_OPTIONS, state="readonly",
                                font=(FONT_MONO, 8))
         cb_mode.grid(row=0, column=1, padx=(4, 8))
         cb_mode.bind("<<ComboboxSelected>>", lambda e: self.on_disp_mode_change())
@@ -1260,8 +1285,7 @@ class SerialChannel(object):
         self.reader_thread.start()
 
         # 复位解码器与 HEX 偏移
-        self.dec_utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        self.dec_gbk = codecs.getincrementaldecoder("gbk")("replace")
+        self._reset_decoder()
         self.hex_buf = b""
         self.hex_off = 0
         self.line_buf = b""
@@ -1354,7 +1378,12 @@ class SerialChannel(object):
                 self.hex_off += 16
             return
 
-        dec = self.dec_utf8 if mode == "UTF-8" else self.dec_gbk
+        dec = self.decoder
+        if dec is None:                 # 理论不会：模式切换时已重建
+            self._reset_decoder()
+            dec = self.decoder
+            if dec is None:
+                return
         text = dec.decode(data)
         if not text:
             return
@@ -1478,8 +1507,7 @@ class SerialChannel(object):
                 self.rx.tag_add(tag, a, b)
 
     def on_disp_mode_change(self):
-        self.dec_utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        self.dec_gbk = codecs.getincrementaldecoder("gbk")("replace")
+        self._reset_decoder()
         self.hex_buf = b""
         self.hex_off = 0
         self.clear_rx()
@@ -1507,8 +1535,7 @@ class SerialChannel(object):
     def reset_runtime(self):
         """把本路运行时状态恢复成"刚打开软件"（刷新软件时用）。"""
         self.line_buf = b""
-        self.dec_utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        self.dec_gbk = codecs.getincrementaldecoder("gbk")("replace")
+        self._reset_decoder()
         self.hex_buf = b""
         self.hex_off = 0
         self.ota_base = ""
