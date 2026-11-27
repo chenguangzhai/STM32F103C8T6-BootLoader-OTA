@@ -2186,17 +2186,16 @@ class OtaSerialApp(object):
                     for d in self.ocd_debuggers)))
 
     def refresh_ports(self):
+        # list_serial_ports() 返回 (device, 显示文本, 是否真实USB串口)，
+        # 且内部已把 USB 串口排最前、蓝牙虚拟口排最后，直接用它的顺序。
         ports = list_serial_ports()
         values = [d for _, d, _ in ports]
 
         # 默认优先真正的 USB 串口：Python 枚举会把蓝牙虚拟串口
         # （"COM13 蓝牙链接上的标准串行"）排在前面，新电脑上直接
         # 打开往往就是它 —— 表现为收不到数据、看起来"功能怪怪的"。
-        def _is_bluetooth(desc, hwid):
-            return ("蓝牙" in desc or "bluetooth" in desc.lower()
-                    or "BTHENUM" in (hwid or "").upper())
-        usb_first = [d for _, d, h in ports if not _is_bluetooth(d, h)]
-        order = usb_first + [v for v in values if v not in usb_first]
+        order = [d for _, d, is_usb in ports if is_usb]
+        order += [d for _, d, is_usb in ports if not is_usb]
 
         chosen = []
         for ch in self.channels:
