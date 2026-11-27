@@ -1,4 +1,4 @@
-# STM32 OTA 串口助手 2.0
+# STM32 OTA 串口助手 2.1
 
 专为这个 OTA BootLoader 工程写的串口调试工具，替代 SSCOM。
 
@@ -18,10 +18,20 @@
 
 「保存日志」改到各接收区右键菜单里（保存本区），两个区的日志互不混淆。
 
+## 2.1 变更（相对 2.0）
+
+| 项 | 2.0 | 2.1 |
+|---|---|---|
+| 复位工具 | 只认 OpenOCD | OpenOCD 优先；找不到时自动改用 `JLink.exe` / `ST-LINK_CLI.exe` / `STM32_Programmer_CLI.exe` |
+| OpenOCD 查找 | EIDE、Program Files | 另支持 `openocd_path`、`OPENOCD_HOME`/`OPENOCD_SCRIPTS`、exe 同目录 `openocd\bin`、PATH、xPack |
+| 无调试器 | 仍显示「就绪」 | 明确提示「未检测到调试器」并禁用复位按钮 |
+| 默认选口 | 列表第一个（可能是蓝牙口） | 优先真正的 USB 串口，蓝牙虚拟口排到最后 |
+| J-Link 识别 | 1366:0101、1366:0105 | 增加 1366:0100 |
+
 界面布局：
 
 ```
-┌ v2.0   刷新端口  刷新软件  设置 ────────────────────────────────────────┐
+┌ v2.1   刷新端口  刷新软件  设置 ────────────────────────────────────────┐
 │ 串口 A [端口][波特率][打开]      │ 串口 B [端口][波特率][打开]      │ 固件发送   │
 │ 显示[UTF-8] □时间戳 □自动滚动 清空│ 显示[UTF-8] □时间戳 □自动滚动 清空│ 选择 bin   │
 │ ┌──────── 接收区 A ────────┐     │ ┌──────── 接收区 B ────────┐     │ 发送到 A/B │
@@ -72,9 +82,11 @@ openocd -f interface/cmsis-dap.cfg -f target/stm32f1x.cfg \
 |---|---|---|
 | DAP-Link / DAPLink | 1FC9:5601、1FC9:0132、0D28:0204 | `cmsis-dap.cfg` |
 | ST-Link V1 / V2 / V2-1 / V3 | 0483:3744 / 3748 / 374B / 374D / 374E / 374F | `stlink.cfg` |
-| J-Link | 1366:0101、1366:0105 | `jlink.cfg` |
+| J-Link | 1366:0100、1366:0101、1366:0105 | `jlink.cfg` |
 
-面板底部绿字会显示实际认到的设备名，比如 `SWD 复位就绪 · ST-Link V2`。
+面板底部绿字会显示实际认到的设备名，比如 `SWD 复位就绪 · ST-Link V2`；
+**一台调试器都没认到**时显示红字「未检测到调试器…」并禁用复位按钮，
+不会再出现"显示就绪、点了必失败"的情况。
 
 判断依据是 **CFGMGR32 的 PRESENT 过滤**，只认此刻真的连着的设备。
 不能用注册表 `Enum\USB` 判断 —— 拔掉的设备键还留在里面，换调试器时
@@ -85,6 +97,33 @@ openocd -f interface/cmsis-dap.cfg -f target/stm32f1x.cfg \
 ```json
 "ocd_iface": "stlink"
 ```
+
+### 换电脑后提示「未找到 OpenOCD」
+
+exe 不自带 OpenOCD。除了装到 EIDE 工具链 / `C:\Program Files\OpenOCD*` 外，
+还可以在 `assist_config.json` 里指定路径（`openocd_path` 可指 exe 或 bin 目录）：
+
+```json
+"openocd_path": "D:/tools/openocd/bin",
+"openocd_scripts": "D:/tools/openocd/share/openocd/scripts"
+```
+
+查找顺序：配置项 → 环境变量 `OPENOCD_HOME` / `OPENOCD_SCRIPTS` →
+exe 同目录的 `openocd\bin`（绿色版整包拷走）→ EIDE → PATH → xPack → Program Files。
+填好后点「刷新软件」即可重新识别，不用重启。
+
+### 没有 OpenOCD 也能复位（J-Link / ST-Link 兜底）
+
+找不到 OpenOCD 时自动改用官方命令行工具，不需要再去装 OpenOCD：
+
+| 调试器 | 兜底工具 | 自动查找位置 |
+|---|---|---|
+| J-Link | `JLink.exe`（SEGGER 驱动自带） | `C:\Program Files*\SEGGER\JLink*`、PATH，或配置 `jlink_path` |
+| ST-Link | `ST-LINK_CLI.exe`；没有则用 `STM32_Programmer_CLI.exe`（CubeMX/CubeIDE/CubeCLT 自带） | `...\STM32 ST-LINK Utility`、`...\STM32CubeProgrammer\bin`；或配置 `stlink_path` / `cubeprog_path` |
+
+J-Link 目标芯片默认 `STM32F103C8`（配置 `jlink_device` 可改），速度默认
+4000 kHz（`jlink_speed` 可改）；面板提示会直接写明用的是哪条后端，例如
+`SWD 复位就绪 · J-Link（JLink.exe，无需 OpenOCD）`。
 
 ### 同时插两块板：选择「复位目标」
 

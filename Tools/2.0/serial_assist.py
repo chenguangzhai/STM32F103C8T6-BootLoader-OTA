@@ -30,9 +30,11 @@ import json
 import os
 import queue
 import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -57,7 +59,7 @@ except ImportError:
 # ==============================================================================
 
 APP_TITLE = "STM32 OTA 串口助手"
-APP_VER = "2.0"
+APP_VER = "2.1"
 
 BAUD_LIST = ["9600", "19200", "38400", "57600", "115200",
              "230400", "460800", "921600"]
@@ -330,6 +332,7 @@ DEBUGGERS = [
     ("VID_0483&PID_374D", "stlink",    "ST-Link V3E"),
     ("VID_0483&PID_374E", "stlink",    "ST-Link V3"),
     ("VID_0483&PID_374F", "stlink",    "ST-Link V3"),
+    ("VID_1366&PID_0100", "jlink",     "J-Link"),
     ("VID_1366&PID_0101", "jlink",     "J-Link"),
     ("VID_1366&PID_0105", "jlink",     "J-Link"),
 ]
@@ -396,27 +399,98 @@ def detect_debuggers():
     return out
 
 
-def find_openocd():
-    """返回 (openocd.exe 绝对路径, scripts 目录)；找不到返回 (None, None)"""
-    pats = [
+def _openocd_scripts(exe):
+    """由 openocd.exe 位置推出 scripts 目录；推不出返回 None。"""
+    root = os.path.dirname(os.path.dirname(exe))
+    scr = os.path.join(root, "share", "openocd", "scripts")
+    if os.path.isdir(os.path.join(scr, "target")):
+        return scr
+    return None
+
+
+def find_openocd(cfg=None, base_dir=None):
+    """返回 (openocd.exe 绝对路径, scripts 目录)；找不到返回 (None, None)
+
+    换一台电脑时 OpenOCD 不一定还在 EIDE 的目录里，所以按优先级多找几处：
+      1. 配置项 openocd_path（可以是 exe，也可以是 bin 目录）
+         / openocd_scripts（单独指定 scripts）
+      2. 环境变量 OPENOCD_HOME / OPENOCD_SCRIPTS
+      3. 程序旁边的 openocd\\bin\\openocd.exe（绿色版：整个工具链一起拷）
+      4. EIDE 工具链 ~/.eide/tools/openocd*/bin
+      5. PATH 里的 openocd（choco / scoop / 手动加环境变量都能命中）
+      6. xPack 安装位置
+      7. Program Files / C:\\OpenOCD
+    """
+    cfg = cfg or {}
+    found = []
+
+    def add_exe(path):
+        if not path:
+            return
+        path = os.path.expanduser(str(path).strip().strip('"'))
+        if os.path.isfile(path) and os.path.basename(path).lower().startswith(
+                "openocd"):
+            found.append(path)
+
+    # 1. 配置项
+    p = str(cfg.get("openocd_path") or "").strip().strip('"')
+    if p:
+        p = os.path.expanduser(p)
+        if os.path.isdir(p):
+            add_exe(os.path.join(p, "openocd.exe"))
+            add_exe(os.path.join(p, "openocd"))
+            add_exe(os.path.join(p, "bin", "openocd.exe"))
+            add_exe(os.path.join(p, "bin", "openocd"))
+        else:
+            add_exe(p)
+
+    # 2. 环境变量
+    home = os.environ.get("OPENOCD_HOME", "")
+    if home:
+        add_exe(os.path.join(home, "bin", "openocd.exe"))
+        add_exe(os.path.join(home, "bin", "openocd"))
+
+    # 3. 程序同目录的 openocd\bin（拷 exe 时连同工具链一起拷）
+    for base in filter(None, (base_dir, os.path.dirname(
+            os.path.abspath(__file__)))):
+        add_exe(os.path.join(base, "openocd", "bin", "openocd.exe"))
+        add_exe(os.path.join(base, "openocd", "bin", "openocd"))
+
+    # 4~7. 常见安装位置
+    patterns = [
         os.path.expanduser("~/.eide/tools/openocd*/bin/openocd.exe"),
         os.path.expanduser("~/.eide/tools/openocd*/bin/openocd"),
+        os.path.expanduser(
+            "~/AppData/Roaming/xPacks/@xpack-dev-tools/openocd/"
+            "*/.content/bin/openocd.exe"),
+        os.path.expanduser(
+            "~/.local/xPacks/@xpack-dev-tools/openocd/"
+            "*/.content/bin/openocd.exe"),
         "C:/Program Files/OpenOCD*/bin/openocd.exe",
         "C:/Program Files (x86)/OpenOCD*/bin/openocd.exe",
+        "C:/OpenOCD*/bin/openocd.exe",
         "/usr/bin/openocd",
+        "/usr/local/bin/openocd",
     ]
-    for pat in pats:
+    for pat in patterns:
         for exe in sorted(glob.glob(pat), reverse=True):
-            if not os.path.isfile(exe):
-                continue
-            root = os.path.dirname(os.path.dirname(exe))
-            for sub in ("share/openocd/scripts", "share/openocd/scripts/"):
-                scr = os.path.join(root, *sub.split("/"))
+            add_exe(exe)
+
+    # 5. PATH
+    add_exe(shutil.which("openocd"))
+
+    # scripts 目录：优先配置/环境变量，其次由 exe 位置推导
+    extra_scripts = [str(cfg.get("openocd_scripts") or "").strip().strip('"'),
+                     os.environ.get("OPENOCD_SCRIPTS", "").strip().strip('"')]
+    for exe in found:
+        for scr in extra_scripts:
+            if scr:
+                scr = os.path.expanduser(scr)
                 if os.path.isdir(os.path.join(scr, "target")):
                     return exe, scr
-            # Linux 包管理装的位置
-            if os.path.isdir("/usr/share/openocd/scripts/target"):
-                return exe, "/usr/share/openocd/scripts"
+        scr = _openocd_scripts(exe)
+        if scr:
+            return exe, scr
     return None, None
 
 
@@ -466,6 +540,191 @@ def openocd_reset(exe, scr, interface="cmsis-dap", target="stm32f1x",
         return False, "调试器未响应：{}".format(
             (out.splitlines() or ["无输出"])[-1])
     return True, "调试器复位完成"
+
+
+def find_jlink(cfg=None):
+    """返回 JLink.exe 路径；找不到返回 None。
+
+    没装 OpenOCD 时的兜底：J-Link 官方驱动自带 JLink.exe 就能复位。
+    """
+    cfg = cfg or {}
+    p = str(cfg.get("jlink_path") or "").strip().strip('"')
+    if p:
+        p = os.path.expanduser(p)
+        if os.path.isdir(p):
+            p = os.path.join(p, "JLink.exe")
+        if os.path.isfile(p):
+            return p
+
+    pats = [
+        "C:/Program Files/SEGGER/JLink*/JLink.exe",
+        "C:/Program Files (x86)/SEGGER/JLink*/JLink.exe",
+        os.path.expanduser("~/AppData/Local/SEGGER/JLink*/JLink.exe"),
+    ]
+    for pat in pats:
+        hits = [x for x in glob.glob(pat) if os.path.isfile(x)]
+        if hits:
+            return sorted(hits, reverse=True)[0]
+    return shutil.which("JLink") or shutil.which("JLink.exe")
+
+
+def find_stlink_cli(cfg=None):
+    """返回 ST-LINK_CLI.exe 路径；找不到返回 None。"""
+    cfg = cfg or {}
+    p = str(cfg.get("stlink_path") or "").strip().strip('"')
+    if p:
+        p = os.path.expanduser(p)
+        if os.path.isdir(p):
+            p = os.path.join(p, "ST-LINK_CLI.exe")
+        if os.path.isfile(p):
+            return p
+
+    pats = [
+        "C:/Program Files (x86)/STMicroelectronics/STM32 ST-LINK Utility/"
+        "ST-LINK Utility/ST-LINK_CLI.exe",
+        "C:/Program Files/STMicroelectronics/STM32 ST-LINK Utility/"
+        "ST-LINK Utility/ST-LINK_CLI.exe",
+    ]
+    for pat in pats:
+        if os.path.isfile(pat):
+            return pat
+    return None
+
+
+def find_cubeprog(cfg=None):
+    """返回 STM32_Programmer_CLI.exe 路径；找不到返回 None。
+
+    ST-Link 的第二条兜底：CubeMX / CubeIDE / CubeCLT 一般都会装它，
+    不依赖已经停更的 ST-LINK Utility。
+    """
+    cfg = cfg or {}
+    p = str(cfg.get("cubeprog_path") or "").strip().strip('"')
+    if p:
+        p = os.path.expanduser(p)
+        if os.path.isdir(p):
+            p = os.path.join(p, "STM32_Programmer_CLI.exe")
+        if os.path.isfile(p):
+            return p
+
+    pats = [
+        "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/"
+        "bin/STM32_Programmer_CLI.exe",
+        "C:/Program Files (x86)/STMicroelectronics/STM32Cube/"
+        "STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+        "C:/Program Files/STMicroelectronics/STM32CubeCLT*/STM32CubeProgrammer/"
+        "bin/STM32_Programmer_CLI.exe",
+        "C:/ST/STM32CubeCLT*/STM32CubeProgrammer/bin/"
+        "STM32_Programmer_CLI.exe",
+        "C:/ST/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+    ]
+    for pat in pats:
+        hits = [x for x in glob.glob(pat) if os.path.isfile(x)]
+        if hits:
+            return sorted(hits, reverse=True)[0]
+    return shutil.which("STM32_Programmer_CLI")
+
+
+def jlink_reset(exe, serial="", device="STM32F103C8", speed="4000",
+                timeout=25):
+    """用 JLink.exe 复位并放开运行，不需要 OpenOCD。
+
+    通过 -CommanderScript 让 J-Link Commander 执行
+        r    复位（停在复位向量）
+        g    放开运行
+        qc   退出并关闭连接
+    返回 (成功?, 说明文本)。
+    """
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(suffix=".jlink", text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("r\ng\nqc\n")
+        cmd = [exe, "-NoGui", "1", "-Device", str(device), "-If", "SWD",
+               "-Speed", str(speed), "-AutoConnect", "1"]
+        if serial:
+            cmd += ["-SelectEmuBySN", str(serial)]
+        cmd += ["-CommanderScript", path]
+        flags = 0x08000000 if os.name == "nt" else 0
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, creationflags=flags)
+        out = (r.stdout or "") + (r.stderr or "")
+        low = out.lower()
+        bad = ("cannot connect", "could not", "no emulator",
+               "failed to", "unknown device")
+        if r.returncode != 0 or any(b in low for b in bad):
+            brief = [l for l in out.splitlines()
+                     if "error" in l.lower() or "fail" in l.lower()][-3:]
+            return False, "J-Link 复位失败：{}".format(
+                " | ".join(brief) or (out.splitlines() or ["无输出"])[-1])
+        return True, "J-Link 复位完成（{}）".format(device)
+    except subprocess.TimeoutExpired:
+        return False, "JLink.exe 超时（{}s），调试器可能没插或正被占用".format(
+            timeout)
+    except FileNotFoundError:
+        return False, "JLink.exe 不存在"
+    except Exception as e:
+        return False, "J-Link 复位异常：{}".format(e)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def stlink_reset(exe, serial="", timeout=25):
+    """用 ST-LINK_CLI.exe -Rst 复位并放开运行，不需要 OpenOCD。"""
+    cmd = [exe, "-c", "SWD"]
+    if serial:
+        cmd += ["-S", str(serial)]
+    cmd += ["-Rst"]
+    flags = 0x08000000 if os.name == "nt" else 0
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, creationflags=flags)
+    except subprocess.TimeoutExpired:
+        return False, "ST-LINK_CLI 超时（{}s）".format(timeout)
+    except FileNotFoundError:
+        return False, "ST-LINK_CLI.exe 不存在"
+    except Exception as e:
+        return False, "ST-LINK 复位异常：{}".format(e)
+
+    out = (r.stdout or "") + (r.stderr or "")
+    low = out.lower()
+    if r.returncode != 0 or "no st-link" in low or "can not connect" in low:
+        brief = [l for l in out.splitlines()
+                 if "error" in l.lower() or "fail" in l.lower()][-3:]
+        return False, "ST-LINK 复位失败：{}".format(
+            " | ".join(brief) or (out.splitlines() or ["无输出"])[-1])
+    return True, "ST-LINK 复位完成"
+
+
+def cubeprog_reset(exe, serial="", timeout=25):
+    """用 STM32_Programmer_CLI.exe -c port=SWD -rst 复位并放开运行。"""
+    conn = "port=SWD"
+    if serial:
+        conn += " sn={}".format(serial)
+    cmd = [exe, "-c", conn, "-rst"]
+    flags = 0x08000000 if os.name == "nt" else 0
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, creationflags=flags)
+    except subprocess.TimeoutExpired:
+        return False, "STM32_Programmer_CLI 超时（{}s）".format(timeout)
+    except FileNotFoundError:
+        return False, "STM32_Programmer_CLI.exe 不存在"
+    except Exception as e:
+        return False, "CubeProgrammer 复位异常：{}".format(e)
+
+    out = (r.stdout or "") + (r.stderr or "")
+    low = out.lower()
+    bad = ("error", "no st-link", "not detected", "failed")
+    if r.returncode != 0 or any(b in low for b in bad):
+        brief = [l for l in out.splitlines()
+                 if "error" in l.lower() or "fail" in l.lower()][-3:]
+        return False, "CubeProgrammer 复位失败：{}".format(
+            " | ".join(brief) or (out.splitlines() or ["无输出"])[-1])
+    return True, "CubeProgrammer 复位完成"
 
 
 # ==============================================================================
@@ -543,6 +802,7 @@ class SerialChannel(object):
         self.ocd_serial_missing = False
         self.ocd_iface_ok = False
         self.ocd_ready = False
+        self.rst_backend = None     # openocd / jlink / stlink
         self.debuggers = []
 
         self._build(parent)
@@ -749,7 +1009,26 @@ class SerialChannel(object):
         self.ocd_iface_ok = bool(
             scr and os.path.isfile(os.path.join(scr, "interface",
                                                 self.ocd_iface + ".cfg")))
-        self.ocd_ready = bool(self.app.ocd_exe) and self.ocd_iface_ok
+        # 一台调试器都没认出来时不能算就绪：否则按钮可点、点了必失败
+        # （OpenOCD 报 "unable to find a matching CMSIS-DAP device"）。
+        # 手工在配置里写了 ocd_iface 视为逃生口，允许继续尝试。
+        self.no_debugger = not self.debuggers \
+            and not (self.app.cfg.get("ocd_iface") or "")
+
+        # 复位后端选择：优先 OpenOCD（interface 脚本齐全），
+        # 没有 OpenOCD 时 J-Link / ST-Link 用官方 CLI 兜底。
+        self.rst_backend = None
+        if not self.no_debugger:
+            if bool(self.app.ocd_exe) and self.ocd_iface_ok:
+                self.rst_backend = "openocd"
+            elif self.ocd_iface == "jlink" and getattr(
+                    self.app, "jlink_exe", None):
+                self.rst_backend = "jlink"
+            elif self.ocd_iface == "stlink" and (
+                    getattr(self.app, "stlink_cli", None)
+                    or getattr(self.app, "cubeprog_exe", None)):
+                self.rst_backend = "stlink"
+        self.ocd_ready = bool(self.rst_backend)
 
     def _current_debugger(self):
         """本路当前选中的调试器字典；自动模式取第一台，没有则 None。"""
@@ -782,26 +1061,47 @@ class SerialChannel(object):
 
     def _apply_ui(self, cfg_iface=""):
         """同步复位按钮/提示文字的颜色与可用性。"""
-        if not self.app.ocd_exe:
-            self.ocd_hint.set("未找到 OpenOCD，请手动按板子复位")
-            ok_color = False
-        elif not self.ocd_iface_ok:
-            self.ocd_hint.set("OpenOCD 缺 interface/{}.cfg，请手动复位".format(
-                self.ocd_iface))
-            ok_color = False
+        ok_color = False
+        if not self.debuggers and not (cfg_iface or ""):
+            hint = ("未检测到调试器（DAP-Link / ST-Link / J-Link），"
+                    "插好后点「刷新软件」")
         elif self.ocd_serial_missing:
-            self.ocd_hint.set("锁定的调试器不在位（{}），复位会失败".format(
-                self.ocd_serial[-8:]))
-            ok_color = False
-        elif cfg_iface and self._current_debugger() \
-                and cfg_iface != self._current_debugger()["iface"]:
-            self.ocd_hint.set("注意：配置锁定 interface/{}，与当前设备不符".format(
-                cfg_iface))
-            ok_color = False
-        else:
-            self.ocd_hint.set("SWD 复位就绪 · {}".format(self.ocd_name))
+            hint = "锁定的调试器不在位（{}），复位会失败".format(
+                self.ocd_serial[-8:])
+        elif self.rst_backend == "openocd":
+            cur = self._current_debugger()
+            if cfg_iface and cur and cfg_iface != cur["iface"]:
+                hint = "注意：配置锁定 interface/{}，与当前设备不符".format(
+                    cfg_iface)
+            else:
+                hint = "SWD 复位就绪 · {}（OpenOCD）".format(self.ocd_name)
+                ok_color = True
+        elif self.rst_backend == "jlink":
+            hint = "SWD 复位就绪 · {}（JLink.exe，无需 OpenOCD）".format(
+                self.ocd_name)
             ok_color = True
+        elif self.rst_backend == "stlink":
+            tool = ("ST-LINK_CLI" if getattr(self.app, "stlink_cli", None)
+                    else "STM32_Programmer_CLI")
+            hint = "SWD 复位就绪 · {}（{}）".format(self.ocd_name, tool)
+            ok_color = True
+        elif not self.app.ocd_exe:
+            if self.ocd_iface == "jlink":
+                hint = ("未找到 OpenOCD / JLink.exe；装 J-Link 驱动，"
+                        "或填 openocd_path")
+            elif self.ocd_iface == "stlink":
+                hint = ("未找到 OpenOCD / ST-LINK_CLI.exe / "
+                        "STM32_Programmer_CLI.exe；可填 openocd_path")
+            else:
+                hint = ("未找到 OpenOCD（可在 assist_config.json 填 "
+                        "openocd_path），请手动复位")
+        elif not self.ocd_iface_ok:
+            hint = ("OpenOCD 缺 interface/{}.cfg，且没有可用的 CLI 兜底，"
+                    "请手动复位".format(self.ocd_iface))
+        else:
+            hint = "复位不可用，请手动按板子复位键"
 
+        self.ocd_hint.set(hint)
         self.lb_ocd_hint.configure(fg=C_OK if ok_color else C_BAD)
         self.btn_rst.configure(state="normal" if self.ocd_ready else "disabled")
 
@@ -845,9 +1145,21 @@ class SerialChannel(object):
             label, "" if self.ocd_serial else "（不指定序列号）"))
 
     def reset_blocking(self):
-        """在后台线程里同步执行一次 OpenOCD 复位（发送流程用）。"""
+        """在后台线程里同步执行一次复位（发送流程用）。
+
+        按 rst_backend 选后端：OpenOCD 优先，其次 J-Link / ST-Link CLI。
+        """
         if not self.ocd_ready:
-            return False, "未找到可用的 OpenOCD / 调试器"
+            return False, "复位后端不可用（缺 OpenOCD / JLink.exe / ST-LINK_CLI）"
+        if self.rst_backend == "jlink":
+            return jlink_reset(
+                self.app.jlink_exe, self.ocd_serial,
+                self.app.cfg.get("jlink_device", "STM32F103C8"),
+                str(self.app.cfg.get("jlink_speed", "4000")))
+        if self.rst_backend == "stlink":
+            if getattr(self.app, "stlink_cli", None):
+                return stlink_reset(self.app.stlink_cli, self.ocd_serial)
+            return cubeprog_reset(self.app.cubeprog_exe, self.ocd_serial)
         return openocd_reset(self.app.ocd_exe, self.app.ocd_scr,
                              self.ocd_iface, self.app.ocd_target,
                              serial=self.ocd_serial)
@@ -855,8 +1167,18 @@ class SerialChannel(object):
     def reset_swd(self):
         """手动 SWD 复位：只复位本路对应的那块板。"""
         if not self.ocd_ready:
-            if not self.app.ocd_exe:
-                msg = "未找到 OpenOCD，无法通过调试器复位。请手动按板子复位键。"
+            if self.no_debugger:
+                msg = ("未检测到调试器。请插好 DAP-Link / ST-Link / J-Link，"
+                       "再点「刷新软件」重扫。")
+            elif self.ocd_iface == "jlink":
+                msg = ("没有可用的复位后端：既没找到 OpenOCD，"
+                       "也没找到 JLink.exe。\n安装 J-Link 驱动，或在 "
+                       "assist_config.json 里填 openocd_path。")
+            elif self.ocd_iface == "stlink":
+                msg = ("没有可用的复位后端：既没找到 OpenOCD，也没找到 "
+                       "ST-LINK_CLI.exe / STM32_Programmer_CLI.exe。\n"
+                       "装 STM32CubeProgrammer（带 CLI），或在 "
+                       "assist_config.json 里填 openocd_path。")
             else:
                 msg = ("OpenOCD 里缺 interface/{}.cfg，认不出当前调试器。"
                        "请手动按板子复位键。".format(self.ocd_iface))
@@ -1391,9 +1713,13 @@ class OtaSerialApp(object):
             pass
 
     def _probe_debugger(self):
-        self.ocd_exe, self.ocd_scr = find_openocd()
+        self.ocd_exe, self.ocd_scr = find_openocd(self.cfg, app_dir())
         self.ocd_debuggers = detect_debuggers()
         self.ocd_target = self.cfg.get("ocd_target", "stm32f1x")
+        # 没 OpenOCD 时的兜底工具（各自独立找，找不到就是 None）
+        self.jlink_exe = find_jlink(self.cfg)
+        self.stlink_cli = find_stlink_cli(self.cfg)
+        self.cubeprog_exe = find_cubeprog(self.cfg)
 
     def rediscover_debuggers(self):
         """轻量重扫：只重认 OpenOCD 与 USB 调试器，并把结果同步到两路。
@@ -1836,6 +2162,15 @@ class OtaSerialApp(object):
         ports = list_serial_ports()
         values = [d for _, d, _ in ports]
 
+        # 默认优先真正的 USB 串口：Python 枚举会把蓝牙虚拟串口
+        # （"COM13 蓝牙链接上的标准串行"）排在前面，新电脑上直接
+        # 打开往往就是它 —— 表现为收不到数据、看起来"功能怪怪的"。
+        def _is_bluetooth(desc, hwid):
+            return ("蓝牙" in desc or "bluetooth" in desc.lower()
+                    or "BTHENUM" in (hwid or "").upper())
+        usb_first = [d for _, d, h in ports if not _is_bluetooth(d, h)]
+        order = usb_first + [v for v in values if v not in usb_first]
+
         chosen = []
         for ch in self.channels:
             cur = ch.port_var.get()
@@ -1845,7 +2180,7 @@ class OtaSerialApp(object):
             elif ch.saved_port in values and ch.saved_port not in chosen:
                 pick = ch.saved_port
             else:
-                pick = next((v for v in values if v not in chosen),
+                pick = next((v for v in order if v not in chosen),
                             values[0] if values else "")
             ch.port_cb["values"] = values
             ch.port_var.set(pick)
